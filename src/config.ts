@@ -45,12 +45,16 @@ export async function loadConfig(root: string): Promise<MemoryConfig> {
     await writeFile(path, JSON.stringify(DEFAULT_CONFIG, null, 2) + "\n", "utf8");
     return { ...DEFAULT_CONFIG };
   }
-  const parsed = JSON.parse(raw) as Record<string, unknown>;
-  const merged: MemoryConfig = { ...DEFAULT_CONFIG };
-  for (const key of CONFIG_KEYS) {
-    if (parsed[key] !== undefined) {
-      (merged as unknown as Record<string, unknown>)[key] = parsed[key];
+  try {
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    const merged: MemoryConfig = { ...DEFAULT_CONFIG };
+    for (const key of CONFIG_KEYS) {
+      if (parsed[key] !== undefined) {
+        (merged as unknown as Record<string, unknown>)[key] = parsed[key];
+      }
     }
+    return merged;
+  } catch {
+    return { ...DEFAULT_CONFIG }; // corrupt config.json → defaults, never throw
   }
-  return merged;
 }

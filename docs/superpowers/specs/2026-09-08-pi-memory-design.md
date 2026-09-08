@@ -87,14 +87,14 @@ repo moves, keeps user repos clean (same choice as Claude Code and Codex CLI).
 
 ```markdown
 ---
-id: mem-a1b2c3d4
-type: decision          # decision | fact | lesson
-title: One-line summary (imperative, specific)
-created: 2026-09-08T09:00:00.000Z
-lastUsed: 2026-09-08T09:00:00.000Z
+id: "mem-a1b2c3d4"
+type: "decision"        # decision | fact | lesson
+title: "One-line summary (imperative, specific)"
+created: "2026-09-08T09:00:00.000Z"
+lastUsed: "2026-09-08T09:00:00.000Z"
 useCount: 0
 strength: 0.5
-scope: project          # project | global
+scope: "project"        # project | global
 pinned: false
 revision: 0             # bumped on consolidation UPDATE
 previousTitles: []      # last 3 superseded titles (provenance)
@@ -102,6 +102,8 @@ previousTitles: []      # last 3 superseded titles (provenance)
 Body: 2–6 sentences. The fact, decision (with the *why*), or lesson (what failed,
 the fix, how to avoid it next time).
 ```
+
+All frontmatter values are JSON-serialized (strings quoted; numbers, booleans, and arrays bare).
 
 - `id`: `mem-` + 8 hex chars (crypto random; collision check against store).
 - `strength`: float 0–1, see §7.

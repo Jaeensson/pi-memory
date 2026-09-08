@@ -151,6 +151,12 @@ export class MarkdownStore {
   readonly root: string;
   readonly projectSlug: string;
   private limits: IndexLimits;
+  private corruptSkipped = 0;
+
+  /** Files skipped by listDir because their frontmatter failed to parse (spec §9 warn-once). */
+  get corruptCount(): number {
+    return this.corruptSkipped;
+  }
 
   constructor(root: string, projectSlug: string, limits?: IndexLimits) {
     this.root = root;
@@ -269,6 +275,7 @@ export class MarkdownStore {
         const raw = await readFile(join(dir, name), "utf8");
         const parsed = parseMemoryFile(raw, scope);
         if (parsed) files.push(parsed);
+        else if (name !== "INDEX.md") this.corruptSkipped += 1; // generated index is not a memory file
       } catch {
         // unreadable file: skip
       }

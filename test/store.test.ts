@@ -51,6 +51,19 @@ describe("MarkdownStore", () => {
     expect(files.map((f) => f.title)).toEqual(["high", "low"]);
   });
 
+  it("list skips corrupt files and counts them in corruptCount", async () => {
+    const { writeFile } = await import("node:fs/promises");
+    await store.save(mem({ title: "valid" }));
+    await writeFile(
+      join(store.scopeDir("project"), "mem-badbad01.md"),
+      "---\ntype: decision\n---\nno id means corrupt",
+      "utf8",
+    );
+    const files = await store.list("project");
+    expect(files.map((f) => f.title)).toEqual(["valid"]);
+    expect(store.corruptCount).toBe(1);
+  });
+
   it("bumpUsage increments useCount and sets lastUsed", async () => {
     const f = await store.save(mem());
     const now = new Date("2026-09-08T12:00:00.000Z");

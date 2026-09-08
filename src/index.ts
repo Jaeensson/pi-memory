@@ -39,7 +39,7 @@ export default function (pi: ExtensionAPI) {
     if (idleTimer) clearTimeout(idleTimer);
     if (!cfg?.enabled || !store || !ctx.model) return;
     idleTimer = setTimeout(() => {
-      void runConsolidationSafely(ctx);
+      void runConsolidationSafely(ctx).catch(() => {}); // session may have gone stale mid-run
     }, cfg.idleSeconds * 1000);
   };
 
@@ -119,7 +119,13 @@ export default function (pi: ExtensionAPI) {
       ctx.ui.notify(`pi-memory consolidation failed: ${msg}`, "warning");
     } finally {
       consolidating = false;
-      if (!failed) await updateWidget(ctx);
+      if (!failed) {
+        try {
+          await updateWidget(ctx);
+        } catch {
+          // session went stale (e.g. /reload) mid-consolidation — widget update is best-effort
+        }
+      }
     }
   };
 
@@ -129,6 +135,13 @@ export default function (pi: ExtensionAPI) {
     const slug = await resolveProjectSlug(ctx.cwd);
     store = new MarkdownStore(memoryRoot, slug, cfg);
     await store.init();
+    await store.all(); // populates corruptCount via listDir
+    if (store.corruptCount > 0) {
+      ctx.ui.notify(
+        `pi-memory: ${store.corruptCount} memory file(s) have corrupt frontmatter and were skipped (files kept on disk)`,
+        "warning",
+      );
+    }
     if (idleTimer) clearTimeout(idleTimer);
     idleTimer = undefined;
     if (!ctx.model) {

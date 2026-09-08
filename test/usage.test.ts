@@ -58,4 +58,18 @@ describe("applyDecayAndPrune", () => {
     expect(await store.get(stale.id)).toBeUndefined();
     expect(await store.get(pinned.id)).toBeDefined();
   });
+
+  it("keeps a memory at exactly the prune-day boundary (strict >)", async () => {
+    // Regression pin: ageDays > pruneDays is strict, so exactly 30d survives with
+    // its recomputed strength. The strength ≥ pruneStrength gate is currently
+    // subsumed by the 30-day rule at default thresholds (halfLifeDays 14 ⇒ any
+    // base ≤ 1 memory ≥ 30d old already has strength < 0.3); it only matters if
+    // thresholds change.
+    const f = await store.save({ type: "fact", title: "boundary", body: "b" });
+    f.lastUsed = new Date(NOW.getTime() - 30 * 86400000).toISOString();
+    await store.update(f);
+    const res = await applyDecayAndPrune(store, { halfLifeDays: 14, pruneDays: 30, pruneStrength: 0.3 }, NOW);
+    expect(res.pruned).not.toContain(f.id);
+    expect(await store.get(f.id)).toBeDefined();
+  });
 });

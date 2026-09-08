@@ -25,6 +25,12 @@ describe("loadConfig", () => {
     expect(cfg.indexMaxTokens).toBe(DEFAULT_CONFIG.indexMaxTokens);
     expect((cfg as unknown as Record<string, unknown>).bogus).toBeUndefined();
   });
+
+  it("falls back to defaults when config.json is not valid JSON", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pimem-"));
+    await writeFile(join(root, "config.json"), "not json {", "utf8");
+    await expect(loadConfig(root)).resolves.toEqual(DEFAULT_CONFIG);
+  });
 });
 
 import { readFile, writeFile } from "node:fs/promises";
