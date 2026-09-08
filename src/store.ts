@@ -1,4 +1,15 @@
-// File format + slug logic. The MarkdownStore class is added in the next task.
+import { randomBytes } from "node:crypto";
+import { createHash } from "node:crypto";
+import {
+  mkdir,
+  readdir,
+  readFile,
+  rename,
+  writeFile,
+} from "node:fs/promises";
+import { join } from "node:path";
+
+// File format, slug logic, and the MarkdownStore persistence layer.
 
 export type MemoryType = "decision" | "fact" | "lesson";
 export type MemoryScope = "project" | "global";
@@ -121,5 +132,209 @@ export async function resolveProjectSlug(cwd: string): Promise<string> {
     return slugForPath(stdout.trim());
   } catch {
     return slugForPath(cwd);
+  }
+}
+
+export interface IndexLimits {
+  indexMaxLines: number;
+  indexMaxBytes: number;
+}
+
+const DEFAULT_LIMITS: IndexLimits = { indexMaxLines: 60, indexMaxBytes: 4000 };
+
+function writeAtomic(path: string, data: string): Promise<void> {
+  const tmp = `${path}.${process.pid}.${Date.now()}.tmp`;
+  return writeFile(tmp, data, "utf8").then(() => rename(tmp, path));
+}
+
+export class MarkdownStore {
+  readonly root: string;
+  readonly projectSlug: string;
+  private limits: IndexLimits;
+
+  constructor(root: string, projectSlug: string, limits?: IndexLimits) {
+    this.root = root;
+    this.projectSlug = projectSlug;
+    this.limits = limits ?? DEFAULT_LIMITS;
+  }
+
+  scopeDir(scope: MemoryScope): string {
+    return scope === "global"
+      ? join(this.root, "global")
+      : join(this.root, "projects", this.projectSlug);
+  }
+
+  archiveDir(scope: MemoryScope): string {
+    return join(this.scopeDir(scope), "archive");
+  }
+
+  async init(): Promise<void> {
+    for (const scope of ["project", "global"] as const) {
+      await mkdir(this.scopeDir(scope), { recursive: true });
+      await mkdir(this.archiveDir(scope), { recursive: true });
+    }
+  }
+
+  private fileTitle(id: string): string {
+    return `${id}.md`;
+  }
+
+  async nextId(): Promise<string> {
+    for (;;) {
+      const id = `mem-${randomBytes(4).toString("hex")}`;
+      if (await this.get(id)) continue;
+      if (await this.findInDir(this.archiveDir("project"), id)) continue;
+      if (await this.findInDir(this.archiveDir("global"), id)) continue;
+      return id;
+    }
+  }
+
+  private async findInDir(dir: string, id: string): Promise<boolean> {
+    try {
+      await readFile(join(dir, this.fileTitle(id)), "utf8");
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  async save(input: {
+    type: MemoryType;
+    title: string;
+    body: string;
+    scope?: MemoryScope;
+    pinned?: boolean;
+  }): Promise<MemoryFile> {
+    const scope = input.scope ?? "project";
+    const now = new Date().toISOString();
+    const file: MemoryFile = {
+      id: await this.nextId(),
+      type: input.type,
+      title: input.title,
+      created: now,
+      lastUsed: now,
+      useCount: 0,
+      strength: 0.5,
+      scope,
+      pinned: input.pinned === true,
+      revision: 0,
+      previousTitles: [],
+      body: input.body,
+    };
+    await writeAtomic(join(this.scopeDir(scope), this.fileTitle(file.id)), serializeMemoryFile(file));
+    await this.regenerateIndex(scope);
+    return file;
+  }
+
+  async get(id: string): Promise<MemoryFile | undefined> {
+    for (const scope of ["project", "global"] as const) {
+      try {
+        const raw = await readFile(join(this.scopeDir(scope), this.fileTitle(id)), "utf8");
+        return parseMemoryFile(raw, scope) ?? undefined;
+      } catch {
+        // try next scope
+      }
+    }
+    return undefined;
+  }
+
+  async update(file: MemoryFile): Promise<void> {
+    await writeAtomic(join(this.scopeDir(file.scope), this.fileTitle(file.id)), serializeMemoryFile(file));
+    await this.regenerateIndex(file.scope);
+  }
+
+  async list(scope: MemoryScope, opts?: { includeArchive?: boolean }): Promise<MemoryFile[]> {
+    const active = await this.listDir(this.scopeDir(scope), scope);
+    if (opts?.includeArchive) {
+      active.push(...(await this.listDir(this.archiveDir(scope), scope)));
+    }
+    return active.sort((a, b) => b.strength - a.strength || a.id.localeCompare(b.id));
+  }
+
+  async all(): Promise<MemoryFile[]> {
+    return [...(await this.list("project")), ...(await this.list("global"))];
+  }
+
+  private async listDir(dir: string, scope: MemoryScope): Promise<MemoryFile[]> {
+    let names: string[];
+    try {
+      names = await readdir(dir);
+    } catch {
+      return [];
+    }
+    const files: MemoryFile[] = [];
+    for (const name of names) {
+      if (!name.endsWith(".md")) continue;
+      try {
+        const raw = await readFile(join(dir, name), "utf8");
+        const parsed = parseMemoryFile(raw, scope);
+        if (parsed) files.push(parsed);
+      } catch {
+        // unreadable file: skip
+      }
+    }
+    return files;
+  }
+
+  async moveToArchive(id: string, reason?: string): Promise<boolean> {
+    for (const scope of ["project", "global"] as const) {
+      const src = join(this.scopeDir(scope), this.fileTitle(id));
+      let raw: string;
+      try {
+        raw = await readFile(src, "utf8");
+      } catch {
+        continue;
+      }
+      const dst = join(this.archiveDir(scope), this.fileTitle(id));
+      await rename(src, dst);
+      if (reason !== undefined) {
+        const hash = createHash("sha256").update(reason + id).digest("hex").slice(0, 8);
+        await writeFile(join(this.archiveDir(scope), `.reason-${hash}`), reason, "utf8");
+      }
+      await this.regenerateIndex(scope);
+      return true;
+    }
+    return false;
+  }
+
+  async bumpUsage(ids: string[], now: Date = new Date()): Promise<number> {
+    let count = 0;
+    for (const id of ids) {
+      const file = await this.get(id);
+      if (!file) continue;
+      file.useCount += 1;
+      file.lastUsed = now.toISOString();
+      await this.update(file);
+      count += 1;
+    }
+    return count;
+  }
+
+  async regenerateIndex(scope: MemoryScope): Promise<void> {
+    const files = (await this.listDir(this.scopeDir(scope), scope)).sort(
+      (a, b) => b.strength - a.strength || a.id.localeCompare(b.id),
+    );
+    const lines: string[] = [];
+    let bytes = 0;
+    for (const f of files) {
+      const line = indexLine(f);
+      if (lines.length >= this.limits.indexMaxLines || bytes + line.length + 1 > this.limits.indexMaxBytes) break;
+      lines.push(line);
+      bytes += line.length + 1;
+    }
+    if (lines.length < files.length) {
+      if (lines.length === this.limits.indexMaxLines) lines.pop(); // trailer takes the last line slot
+      lines.push(`…${files.length - lines.length - 1} more — use memory_search`);
+    }
+    await writeAtomic(join(this.scopeDir(scope), "INDEX.md"), lines.join("\n") + (lines.length ? "\n" : ""));
+  }
+
+  async indexLines(scope: MemoryScope): Promise<string[]> {
+    try {
+      const raw = await readFile(join(this.scopeDir(scope), "INDEX.md"), "utf8");
+      return raw.split("\n").filter((l) => l.length > 0);
+    } catch {
+      return [];
+    }
   }
 }
