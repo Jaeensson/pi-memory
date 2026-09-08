@@ -16,7 +16,7 @@ const SECRET_PATTERNS: { re: RegExp; label: string }[] = [
   { re: /\bgh[pousr]_[A-Za-z0-9]{20,}\b/, label: "GitHub token" },
   { re: /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/, label: "Slack token" },
   { re: /\bBearer\s+[A-Za-z0-9._-]{20,}\b/, label: "Bearer token" },
-  { re: /\b(?:API_?KEY|SECRET|TOKEN|PASSWORD)[A-Z_]*\s*[:=]\s*\S{8,}/i, label: "credential assignment" },
+  { re: /\b(?:API_?KEY|SECRET|TOKEN|PASSWORD)[A-Z_]*\s*[:=>]\s*\S{8,}/i, label: "credential assignment" },
   { re: /\b[A-Za-z0-9+/]{40,}={0,2}\b/, label: "base64 blob" },
   { re: /\b[0-9a-f]{32,}\b/i, label: "hex blob" },
 ];
@@ -49,8 +49,9 @@ export async function dedupCheck(
   for (const file of await store.all()) {
     if (file.type !== cand.type) continue;
     if (normalizeTitle(file.title) === normalizeTitle(cand.title)) return file;
+    const bodyWords = file.body.toLowerCase().replace(/\W+/g, " ");
     for (const gram of candGrams) {
-      if (file.body.toLowerCase().includes(gram)) return file;
+      if (bodyWords.includes(gram)) return file;
     }
   }
   return null;

@@ -27,6 +27,7 @@ describe("secretScan", () => {
     ["xoxb-123456789012-abc", "Slack"],
     ["Authorization: Bearer abcdefghijklmnopqrst", "Bearer"],
     ["API_KEY=supersecret123", "assignment"],
+    ["PASSWORD> hunter2secret", "assignment"],
     ["AAAAcHJldGVuZGVkLWxvbmctYmFzZTY0LWJsb2JiYXR0ZWhjb2Rl", "base64"],
     ["deadbeefdeadbeefdeadbeefdeadbeef1", "hex"],
   ])("rejects %s", (text) => {
@@ -54,6 +55,20 @@ describe("dedupCheck", () => {
     const hit = await dedupCheck(store, {
       title: "different title",
       body: "prefix one two three four five six seven eight nine ten suffix",
+      type: "lesson",
+    });
+    expect(hit).not.toBeNull();
+  });
+
+  it("flags shared 8-word sequence spanning punctuation in stored body", async () => {
+    await store.save({
+      type: "lesson",
+      title: "held",
+      body: "alpha beta gamma, delta epsilon\nzeta eta theta",
+    });
+    const hit = await dedupCheck(store, {
+      title: "unrelated",
+      body: "alpha beta gamma delta epsilon zeta eta theta repeated",
       type: "lesson",
     });
     expect(hit).not.toBeNull();
