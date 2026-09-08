@@ -18,7 +18,7 @@ export interface InjectionInput {
 export function trimIndexLines(
   lines: string[],
   maxTokens: number,
-): { kept: string[]; dropped: number } {
+): { kept: string[]; dropped: number; tokens: number } {
   const kept: string[] = [];
   let tokens = 0;
   for (const line of lines) {
@@ -32,13 +32,21 @@ export function trimIndexLines(
     // Reserve a slot for the trailer: drop entry lines until it fits, keeping the
     // kept lines within maxTokens (mirrors MarkdownStore.regenerateIndex). The
     // count is honest: entries shown + N = total input lines.
-    const trailerCost = estimateTokens(`…${hidden} more — use memory_search`) + 1;
-    while (kept.length > 0 && tokens + trailerCost > maxTokens) {
+    while (kept.length > 0) {
+      const cost = estimateTokens(`…${lines.length - kept.length} more — use memory_search`) + 1;
+      if (tokens + cost <= maxTokens) break;
       tokens -= estimateTokens(kept.pop()!) + 1;
     }
-    kept.push(`…${lines.length - kept.length} more — use memory_search`);
+    const trailer = `…${lines.length - kept.length} more — use memory_search`;
+    const trailerCost = estimateTokens(trailer) + 1;
+    if (tokens + trailerCost > maxTokens) {
+      // The budget cannot fit even the trailer: emit an empty lane rather than breach.
+      return { kept: [], dropped: lines.length, tokens: 0 };
+    }
+    kept.push(trailer);
+    tokens += trailerCost;
   }
-  return { kept, dropped: lines.length - kept.length };
+  return { kept, dropped: lines.length - kept.length, tokens };
 }
 
 export async function gatherInjection(
@@ -76,12 +84,11 @@ export function renderMemoryBlock(
     out.push("Pinned instructions (always apply):", ...pinLines);
   }
 
-  // Index lane.
+  // Index lane: both sub-lanes share the same per-line token accounting, so the
+  // global budget is exactly what the project lane did not spend of the cap.
   const project = trimIndexLines(input.projectIndex, cfg.indexMaxTokens);
-  const remaining = cfg.indexMaxTokens - Math.ceil(
-    project.kept.reduce((n, l) => n + l.length + 1, 0) / 4,
-  );
-  const global = trimIndexLines(input.globalIndex, Math.max(0, remaining));
+  const remaining = Math.max(0, cfg.indexMaxTokens - project.tokens);
+  const global = trimIndexLines(input.globalIndex, remaining);
   const indexLines = [...project.kept, ...global.kept];
   if (indexLines.length > 0) {
     out.push(
@@ -93,6 +100,6 @@ export function renderMemoryBlock(
   out.push(POLICY_TEXT);
   return {
     text: out.join("\n"),
-    tokens: { pinned: pinTokens, index: estimateTokens(indexLines.join("\n")) },
+    tokens: { pinned: pinTokens, index: project.tokens + global.tokens },
   };
 }

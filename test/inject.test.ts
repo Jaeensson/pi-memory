@@ -41,6 +41,13 @@ describe("trimIndexLines", () => {
     expect(kept).toEqual(lines);
     expect(dropped).toBe(0);
   });
+
+  it("returns an empty lane when the budget cannot fit even the trailer", () => {
+    const { kept, dropped, tokens } = trimIndexLines(["- [mem-00000001] (fact) one"], 0);
+    expect(kept).toEqual([]);
+    expect(dropped).toBe(1);
+    expect(tokens).toBe(0);
+  });
 });
 
 describe("renderMemoryBlock", () => {
@@ -62,6 +69,24 @@ describe("renderMemoryBlock", () => {
     expect(out.text).toContain("correct");
     expect(out.tokens.pinned).toBeLessThanOrEqual(DEFAULT_CONFIG.pinnedMaxTokens);
     expect(out.tokens.index).toBeLessThanOrEqual(DEFAULT_CONFIG.indexMaxTokens);
+  });
+
+  it("caps the composite index lane even when one project line fills the budget", () => {
+    // 24-char prefix + 1572 filler = 1596 chars ≈ 399 tokens (+1 newline = 400).
+    const bigLine = `- [mem-44444444] (fact) ${"y".repeat(1572)}`;
+    expect(estimateTokens(bigLine) + 1).toBe(DEFAULT_CONFIG.indexMaxTokens);
+    const out = renderMemoryBlock(
+      {
+        pinned: [],
+        projectIndex: [bigLine],
+        globalIndex: ["- [mem-55555555] (lesson) Ask before destructive db ops"],
+      },
+      DEFAULT_CONFIG,
+    );
+    expect(out.tokens.index).toBeLessThanOrEqual(DEFAULT_CONFIG.indexMaxTokens);
+    // Global lane contributes nothing: no global entry, no overflow trailer.
+    expect(out.text).not.toContain("[mem-55555555]");
+    expect(out.text).not.toContain("more — use memory_search");
   });
 
   it("drops oldest pins first when over the pinned budget", () => {
