@@ -1,0 +1,85 @@
+import { describe, expect, it } from "vitest";
+import {
+  indexLine,
+  parseMemoryFile,
+  serializeMemoryFile,
+  slugForPath,
+} from "../src/store.js";
+
+const sample = (): Parameters<typeof serializeMemoryFile>[0] => ({
+  id: "mem-a1b2c3d4",
+  type: "decision",
+  title: "Use pnpm workspace filters for test runs",
+  created: "2026-09-08T09:00:00.000Z",
+  lastUsed: "2026-09-08T09:00:00.000Z",
+  useCount: 3,
+  strength: 0.82,
+  scope: "project",
+  pinned: false,
+  revision: 0,
+  previousTitles: [],
+  body: "Filter to the touched workspace to keep CI under 5 minutes.",
+});
+
+describe("parseMemoryFile / serializeMemoryFile", () => {
+  it("round-trips a memory file", () => {
+    const raw = serializeMemoryFile(sample());
+    const parsed = parseMemoryFile(raw, "project");
+    expect(parsed).toEqual(sample());
+  });
+
+  it("returns null on missing frontmatter", () => {
+    expect(parseMemoryFile("just text, no frontmatter", "project")).toBeNull();
+  });
+
+  it("returns null on invalid frontmatter values", () => {
+    const raw = [
+      "---",
+      "id: mem-a1b2c3d4",
+      "type: bogus",
+      "title: x",
+      "created: nope",
+      "lastUsed: nope",
+      "useCount: -3",
+      "strength: 5",
+      "scope: project",
+      "pinned: false",
+      "revision: 0",
+      "previousTitles: []",
+      "---",
+      "body",
+    ].join("\n");
+    expect(parseMemoryFile(raw, "project")).toBeNull();
+  });
+
+  it("applies fallbackScope when frontmatter scope is missing", () => {
+    const raw = serializeMemoryFile(sample()).replace('scope: "project"\n', "");
+    const parsed = parseMemoryFile(raw, "global");
+    expect(parsed?.scope).toBe("global");
+  });
+});
+
+describe("indexLine", () => {
+  it("formats id, type, use count, title", () => {
+    expect(indexLine(sample())).toBe(
+      "- [mem-a1b2c3d4] (decision ×3) Use pnpm workspace filters for test runs",
+    );
+  });
+
+  it("omits the use-count marker when useCount is 0", () => {
+    const m = { ...sample(), useCount: 0 };
+    expect(indexLine(m)).toBe(
+      "- [mem-a1b2c3d4] (decision) Use pnpm workspace filters for test runs",
+    );
+  });
+});
+
+describe("slugForPath", () => {
+  it("slugifies a posix path", () => {
+    expect(slugForPath("/Users/rasmus/src/MyApp")).toBe("users-rasmus-src-myapp");
+  });
+
+  it("collapses separators and trims", () => {
+    expect(slugForPath("/a//b/c/")).toBe("a-b-c");
+  });
+});
