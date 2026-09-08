@@ -8,7 +8,6 @@ import { registerMemoryCommands } from "./commands.js";
 import { gatherInjection, renderMemoryBlock } from "./inject.js";
 import {
   runConsolidation,
-  WatermarkStore,
   type CompleteFn,
   type SessionEntryLike,
 } from "./consolidate.js";
@@ -90,6 +89,7 @@ export default function (pi: ExtensionAPI) {
 
   const runConsolidationSafely = async (ctx: ExtensionContext) => {
     if (!store || !cfg || consolidating || !ctx.model) return;
+    let failed = false;
     consolidating = true;
     ctx.ui.setWidget("pi-memory", ["memory: consolidating…"]);
     try {
@@ -105,6 +105,7 @@ export default function (pi: ExtensionAPI) {
         now: new Date(),
       });
       if (!result.ok) {
+        failed = true;
         ctx.ui.setWidget("pi-memory", ["memory: idle (consolidation failed — will retry)"]);
         ctx.ui.notify(`pi-memory consolidation failed: ${result.reason}`, "warning");
       } else {
@@ -112,12 +113,13 @@ export default function (pi: ExtensionAPI) {
         if (changed > 0) ctx.ui.notify(`pi-memory: +${result.applied?.added.length ?? 0} ~${result.applied?.updated.length ?? 0} -${result.applied?.deleted.length ?? 0} pruned ${result.pruned?.length ?? 0}`, "info");
       }
     } catch (err) {
+      failed = true;
       const msg = err instanceof Error ? err.message : String(err);
       ctx.ui.setWidget("pi-memory", ["memory: idle (consolidation failed — will retry)"]);
       ctx.ui.notify(`pi-memory consolidation failed: ${msg}`, "warning");
     } finally {
       consolidating = false;
-      await updateWidget(ctx);
+      if (!failed) await updateWidget(ctx);
     }
   };
 
@@ -127,9 +129,11 @@ export default function (pi: ExtensionAPI) {
     const slug = await resolveProjectSlug(ctx.cwd);
     store = new MarkdownStore(memoryRoot, slug, cfg);
     await store.init();
+    if (idleTimer) clearTimeout(idleTimer);
     idleTimer = undefined;
     if (!ctx.model) {
       ctx.ui.setWidget("pi-memory", ["memory: idle (no model)"]);
+      return;
     }
     await updateWidget(ctx);
   });
