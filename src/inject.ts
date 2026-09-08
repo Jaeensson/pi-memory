@@ -1,0 +1,98 @@
+import type { MemoryConfig } from "./config.js";
+import type { MarkdownStore, MemoryFile } from "./store.js";
+
+export const POLICY_TEXT =
+  "Use memory_search <query> to find more. Save durable decisions, facts, and " +
+  "lessons with memory_save — save immediately when the user corrects you.";
+
+export function estimateTokens(text: string): number {
+  return Math.ceil(text.length / 4);
+}
+
+export interface InjectionInput {
+  pinned: MemoryFile[];
+  projectIndex: string[];
+  globalIndex: string[];
+}
+
+export function trimIndexLines(
+  lines: string[],
+  maxTokens: number,
+): { kept: string[]; dropped: number } {
+  const kept: string[] = [];
+  let tokens = 0;
+  for (const line of lines) {
+    const cost = estimateTokens(line) + 1;
+    if (tokens + cost > maxTokens) break;
+    kept.push(line);
+    tokens += cost;
+  }
+  const hidden = lines.length - kept.length;
+  if (hidden > 0) {
+    // Reserve a slot for the trailer: drop entry lines until it fits, keeping the
+    // kept lines within maxTokens (mirrors MarkdownStore.regenerateIndex). The
+    // count is honest: entries shown + N = total input lines.
+    const trailerCost = estimateTokens(`…${hidden} more — use memory_search`) + 1;
+    while (kept.length > 0 && tokens + trailerCost > maxTokens) {
+      tokens -= estimateTokens(kept.pop()!) + 1;
+    }
+    kept.push(`…${lines.length - kept.length} more — use memory_search`);
+  }
+  return { kept, dropped: lines.length - kept.length };
+}
+
+export async function gatherInjection(
+  store: MarkdownStore,
+  cfg: MemoryConfig,
+): Promise<InjectionInput> {
+  const pinned = (await store.all())
+    .filter((f) => f.pinned)
+    .sort((a, b) => b.lastUsed.localeCompare(a.lastUsed));
+  return {
+    pinned,
+    projectIndex: await store.indexLines("project"),
+    globalIndex: cfg.globalEnabled ? await store.indexLines("global") : [],
+  };
+}
+
+export function renderMemoryBlock(
+  input: InjectionInput,
+  cfg: MemoryConfig,
+): { text: string; tokens: { pinned: number; index: number } } {
+  const out: string[] = ["## Memory"];
+
+  // Pinned lane: pins are sorted newest-first (by gatherInjection), so once the
+  // budget is exhausted this `continue` skips every remaining (older) pin.
+  const pinLines: string[] = [];
+  let pinTokens = 0;
+  for (const p of input.pinned) {
+    const line = `- [${p.id}] ${p.body}`;
+    const cost = estimateTokens(line) + 1;
+    if (pinTokens + cost > cfg.pinnedMaxTokens) continue;
+    pinLines.push(line);
+    pinTokens += cost;
+  }
+  if (pinLines.length > 0) {
+    out.push("Pinned instructions (always apply):", ...pinLines);
+  }
+
+  // Index lane.
+  const project = trimIndexLines(input.projectIndex, cfg.indexMaxTokens);
+  const remaining = cfg.indexMaxTokens - Math.ceil(
+    project.kept.reduce((n, l) => n + l.length + 1, 0) / 4,
+  );
+  const global = trimIndexLines(input.globalIndex, Math.max(0, remaining));
+  const indexLines = [...project.kept, ...global.kept];
+  if (indexLines.length > 0) {
+    out.push(
+      "Relevant memories for this project (details via memory_read <id>):",
+      ...indexLines,
+    );
+  }
+
+  out.push(POLICY_TEXT);
+  return {
+    text: out.join("\n"),
+    tokens: { pinned: pinTokens, index: estimateTokens(indexLines.join("\n")) },
+  };
+}
