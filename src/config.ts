@@ -1,4 +1,4 @@
-import { readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 export interface MemoryConfig {
@@ -42,6 +42,7 @@ export async function loadConfig(root: string): Promise<MemoryConfig> {
     raw = undefined;
   }
   if (raw === undefined) {
+    await mkdir(root, { recursive: true }); // root may not exist on first run (e.g. ~/.pi/agent/memory)
     await writeFile(path, JSON.stringify(DEFAULT_CONFIG, null, 2) + "\n", "utf8");
     return { ...DEFAULT_CONFIG };
   }

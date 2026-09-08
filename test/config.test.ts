@@ -31,6 +31,15 @@ describe("loadConfig", () => {
     await writeFile(join(root, "config.json"), "not json {", "utf8");
     await expect(loadConfig(root)).resolves.toEqual(DEFAULT_CONFIG);
   });
+
+  it("creates a non-existent root directory on first run", async () => {
+    const base = await mkdtemp(join(tmpdir(), "pimem-"));
+    const root = join(base, "does-not-exist", "nested"); // no mkdir anywhere
+    const cfg = await loadConfig(root);
+    expect(cfg).toEqual(DEFAULT_CONFIG);
+    const written = JSON.parse(await readFile(join(root, "config.json"), "utf8"));
+    expect(written.idleSeconds).toBe(60);
+  });
 });
 
 import { readFile, writeFile } from "node:fs/promises";
