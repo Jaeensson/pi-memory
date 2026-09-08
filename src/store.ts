@@ -1,5 +1,4 @@
-import { randomBytes } from "node:crypto";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import {
   mkdir,
   readdir,
@@ -143,7 +142,9 @@ export interface IndexLimits {
 const DEFAULT_LIMITS: IndexLimits = { indexMaxLines: 60, indexMaxBytes: 4000 };
 
 function writeAtomic(path: string, data: string): Promise<void> {
-  const tmp = `${path}.${process.pid}.${Date.now()}.tmp`;
+  // Unique tmp suffix: two concurrent writes to the same path (parallel tool
+  // calls are pi's default) must never share a tmp filename.
+  const tmp = `${path}.${process.pid}.${Date.now()}.${randomBytes(4).toString("hex")}.tmp`;
   return writeFile(tmp, data, "utf8").then(() => rename(tmp, path));
 }
 
@@ -152,6 +153,9 @@ export class MarkdownStore {
   readonly projectSlug: string;
   private limits: IndexLimits;
   private corruptSkipped = 0;
+
+  /** Serializes index writes so parallel mutations cannot race regenerateIndex. */
+  private indexQueue: Promise<void> = Promise.resolve();
 
   /** Files skipped by listDir because their frontmatter failed to parse (spec §9 warn-once). */
   get corruptCount(): number {
@@ -318,6 +322,14 @@ export class MarkdownStore {
   }
 
   async regenerateIndex(scope: MemoryScope): Promise<void> {
+    // Exclusive: concurrent tool calls (pi's default) each end in a queued
+    // regenerateIndex, so the final one always reflects every completed write.
+    const run = this.indexQueue.then(() => this.regenerateIndexUnlocked(scope));
+    this.indexQueue = run.then(() => undefined, () => undefined);
+    return run;
+  }
+
+  private async regenerateIndexUnlocked(scope: MemoryScope): Promise<void> {
     const files = (await this.listDir(this.scopeDir(scope), scope)).sort(
       (a, b) => b.strength - a.strength || a.id.localeCompare(b.id),
     );

@@ -99,4 +99,28 @@ describe("MarkdownStore", () => {
     for (let i = 0; i < 5; i++) seen.add(await store.nextId());
     expect(seen.size).toBe(5);
   });
+
+  it("handles concurrent saves without tmp-file collisions or a torn index", async () => {
+    // pi runs tool calls in parallel by default; several saves in one batch must
+    // not share writeAtomic tmp filenames or leave INDEX.md missing entries.
+    const saved = await Promise.all(
+      Array.from({ length: 10 }, (_, i) =>
+        store.save({ type: "decision", title: `concurrent ${i}`, body: `body ${i}` }),
+      ),
+    );
+    const ids = saved.map((f) => f.id);
+    expect(new Set(ids).size).toBe(10);
+    const lines = await store.indexLines("project");
+    for (const id of ids) {
+      expect(lines.some((l) => l.includes(id))).toBe(true); // every memory in the index
+    }
+    // A second concurrent wave (exercises queued index regeneration ordering).
+    await Promise.all(
+      Array.from({ length: 5 }, (_, i) =>
+        store.save({ type: "fact", title: `wave2 ${i}`, body: `b ${i}` }),
+      ),
+    );
+    const lines2 = await store.indexLines("project");
+    expect(lines2.length).toBeGreaterThanOrEqual(10);
+  });
 });
