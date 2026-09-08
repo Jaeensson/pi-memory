@@ -323,8 +323,17 @@ export class MarkdownStore {
       bytes += line.length + 1;
     }
     if (lines.length < files.length) {
-      if (lines.length === this.limits.indexMaxLines) lines.pop(); // trailer takes the last line slot
-      lines.push(`…${files.length - lines.length - 1} more — use memory_search`);
+      // The trailer occupies the last slot inside both caps; drop entry lines until it fits.
+      // Hidden count = files.length - (rendered entry lines), honest with the trailer slot included.
+      while (
+        lines.length > 0 &&
+        (lines.length + 1 > this.limits.indexMaxLines ||
+          bytes + `…${files.length - lines.length} more — use memory_search`.length + 1 >
+            this.limits.indexMaxBytes)
+      ) {
+        bytes -= lines.pop()!.length + 1;
+      }
+      lines.push(`…${files.length - lines.length} more — use memory_search`);
     }
     await writeAtomic(join(this.scopeDir(scope), "INDEX.md"), lines.join("\n") + (lines.length ? "\n" : ""));
   }

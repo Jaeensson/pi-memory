@@ -78,7 +78,7 @@ describe("MarkdownStore", () => {
     for (let i = 0; i < 5; i++) await small.save(mem({ title: `memory number ${i}` }));
     const lines = await small.indexLines("project");
     expect(lines).toHaveLength(3);
-    expect(lines[2]).toMatch(/…2 more — use memory_search/);
+    expect(lines[2]).toMatch(/…3 more — use memory_search/);
   });
 
   it("nextId avoids collisions", async () => {
