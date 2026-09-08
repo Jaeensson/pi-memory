@@ -64,11 +64,19 @@ export function parseMemoryFile(raw: string, fallbackScope: MemoryScope): Memory
   if (typeof id !== "string" || !/^mem-[0-9a-f]{8}$/.test(id)) return null;
   const type = fields.type;
   if (type !== "decision" && type !== "fact" && type !== "lesson") return null;
-  const scope = fields.scope === "global" ? "global" : fields.scope === "project" ? "project" : fallbackScope;
+  const scope =
+    fields.scope === undefined
+      ? fallbackScope // field absent → caller's default
+      : fields.scope === "project" || fields.scope === "global"
+        ? fields.scope
+        : null; // field present but invalid → corrupt
+  if (scope === null) return null;
+  const ISO_UTC = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{3})?Z$/;
+  const isIsoUtc = (v: unknown): v is string =>
+    typeof v === "string" && ISO_UTC.test(v) && !Number.isNaN(Date.parse(v));
   const created = fields.created;
   const lastUsed = fields.lastUsed;
-  if (typeof created !== "string" || Number.isNaN(Date.parse(created))) return null;
-  if (typeof lastUsed !== "string" || Number.isNaN(Date.parse(lastUsed))) return null;
+  if (!isIsoUtc(created) || !isIsoUtc(lastUsed)) return null;
   const useCount = fields.useCount;
   if (typeof useCount !== "number" || !Number.isInteger(useCount) || useCount < 0) return null;
   const strength = fields.strength;

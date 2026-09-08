@@ -57,6 +57,19 @@ describe("parseMemoryFile / serializeMemoryFile", () => {
     const parsed = parseMemoryFile(raw, "global");
     expect(parsed?.scope).toBe("global");
   });
+
+  it("returns null when scope is present but invalid", () => {
+    const raw = serializeMemoryFile(sample()).replace('scope: "project"', 'scope: "projecy"');
+    expect(parseMemoryFile(raw, "project")).toBeNull();
+  });
+
+  it("returns null when a date is Date.parse-able but not ISO-8601 UTC", () => {
+    const raw = serializeMemoryFile(sample()).replace(
+      'created: "2026-09-08T09:00:00.000Z"',
+      'created: "Sept 8, 2026"',
+    );
+    expect(parseMemoryFile(raw, "project")).toBeNull();
+  });
 });
 
 describe("indexLine", () => {
