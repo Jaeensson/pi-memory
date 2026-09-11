@@ -189,6 +189,17 @@ parameters: {
 Keyword search: split query into terms (lowercase, strip stopwords), score = term hits in
 title (×3) + body (×1), rank, return `id | type | title` lines. Never returns bodies.
 
+> **Amendment (2026-09-11, post-implementation):** a diagnostic spike against the real store
+> showed 5/10 realistic queries missed, so the scorer was upgraded. Terms are stemmed (light
+> suffix stripping: -s/-es/-ies/-ing/-ed) and matched stem-to-stem; word-start prefixes (both
+> stems ≥4 chars) count as exact (so "test" cannot hit "fastest"); terms ≥4 chars with no
+> exact/stem match tolerate one edit (Levenshtein ≤1) at title ×1 / body ×1; `previousTitles`
+> are searchable at body weight; body hits from terms present in most bodies (df ≥2 and
+> df/N > 0.5) earn nothing — title hits are never gated. Known accepted trade-offs: one stray
+> low-score hit is possible on queries with no store target (dist-1 collisions like
+> "chart"~"chars"), and synonym mismatches ("trash" vs "archive") remain unsolved — the
+> SearchStrategy seam is the extension point if embeddings are ever added.
+
 ### memory_read
 
 ```ts

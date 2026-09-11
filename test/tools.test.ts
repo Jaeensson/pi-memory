@@ -124,6 +124,111 @@ describe("handleMemorySearch", () => {
   });
 });
 
+describe("handleMemorySearch relevance", () => {
+  const textOf = (res: { content: { text: string }[] }) => res.content[0].text;
+
+  it("matches morphological variants via stem prefixes (archiving → archival)", async () => {
+    await store.save({
+      type: "fact",
+      title: "strength decay: weak memories are archival after 30 days",
+      body: "unrelated words here",
+    });
+    const res = await handleMemorySearch(store, { query: "archiving" });
+    expect(textOf(res)).toContain("archival after 30 days");
+  });
+
+  it("matches verb forms against base forms (retrying → retry)", async () => {
+    await store.save({ type: "lesson", title: "test runner needs retry for flaky suites", body: "x" });
+    const res = await handleMemorySearch(store, { query: "retrying tests" });
+    expect(textOf(res)).toContain("retry for flaky suites");
+  });
+
+  it("tolerates one-character typos in longer terms", async () => {
+    await store.save({
+      type: "fact",
+      title: "consolidation watermark resumes after restart",
+      body: "unrelated words here",
+    });
+    const res = await handleMemorySearch(store, { query: "conslidation" });
+    expect(textOf(res)).toContain("consolidation watermark");
+  });
+
+  it("does not fuzzy-match short terms (coe ↛ core)", async () => {
+    await store.save({ type: "fact", title: "core loop design", body: "y" });
+    const res = await handleMemorySearch(store, { query: "coe" });
+    expect(textOf(res)).toContain("No matching memories");
+  });
+
+  it("requires two edits to exceed typo tolerance (test ↛ toast)", async () => {
+    await store.save({ type: "fact", title: "toast notification settings", body: "y" });
+    const res = await handleMemorySearch(store, { query: "test" });
+    expect(textOf(res)).toContain("No matching memories");
+  });
+
+  it("tolerates one-character typos in body-only terms", async () => {
+    await store.save({
+      type: "fact",
+      title: "unrelated title words only",
+      body: "the consolidation watermark advances after each run",
+    });
+    const res = await handleMemorySearch(store, { query: "conslidation" });
+    expect(textOf(res)).toContain("unrelated title words only");
+  });
+
+  it("does not substring-match inside unrelated words (test ↛ fastest)", async () => {
+    await store.save({ type: "fact", title: "fastest CI pipeline", body: "protest banners everywhere" });
+    const res = await handleMemorySearch(store, { query: "test" });
+    expect(textOf(res)).toContain("No matching memories");
+  });
+
+  it("matches word starts with sufficient prefix (auth → authenticated)", async () => {
+    await store.save({ type: "fact", title: "websocket uses authenticated sessions", body: "y" });
+    const res = await handleMemorySearch(store, { query: "auth websocket" });
+    expect(textOf(res)).toContain("authenticated sessions");
+  });
+
+  it("finds memories by their previous (superseded) titles", async () => {
+    const saved = await store.save({
+      type: "decision",
+      title: "deploy runs via GitHub Actions",
+      body: "workflow triggers on release tags",
+    });
+    const file = (await store.get(saved.id))!;
+    file.title = "deploy runs via a dedicated runner";
+    file.previousTitles = ["deploy via bare git push to droplet"];
+    await store.update(file);
+    const res = await handleMemorySearch(store, { query: "bare droplet push" });
+    expect(textOf(res)).toContain("deploy runs via a dedicated runner");
+  });
+
+  it("ignores body-only hits for terms common across the store (noise gate)", async () => {
+    await store.save({ type: "fact", title: "rust backend", body: "the server handles requests" });
+    await store.save({ type: "fact", title: "sveltekit frontend", body: "the server sends events" });
+    await store.save({ type: "fact", title: "game templates", body: "the server config lives elsewhere" });
+    const res = await handleMemorySearch(store, { query: "server" });
+    expect(textOf(res)).toContain("No matching memories");
+  });
+
+  it("keeps body-only hits for rare terms", async () => {
+    await store.save({ type: "fact", title: "rust backend", body: "hashing uses argon2id parameters" });
+    await store.save({ type: "fact", title: "sveltekit frontend", body: "form validation is zod-based" });
+    await store.save({ type: "fact", title: "game templates", body: "templates are config not code" });
+    const res = await handleMemorySearch(store, { query: "argon2id hashing" });
+    expect(textOf(res)).toContain("rust backend");
+  });
+
+  it("breaks score ties by strength", async () => {
+    const first = await store.save({ type: "fact", title: "alpha note", body: "b" });
+    await store.save({ type: "fact", title: "omega note", body: "b" });
+    const file = (await store.get(first.id))!;
+    file.strength = 0.9;
+    await store.update(file);
+    const res = await handleMemorySearch(store, { query: "note" });
+    const text = textOf(res);
+    expect(text.indexOf("alpha note")).toBeLessThan(text.indexOf("omega note"));
+  });
+});
+
 describe("handleMemoryRead", () => {
   it("returns body and bumps usage", async () => {
     const saved = await store.save({ type: "fact", title: "T", body: "the body text" });
