@@ -123,11 +123,37 @@ export function slugForPath(p: string): string {
     .join("-");
 }
 
+/**
+ * Slug for a git remote URL. Machine-independent identity: the same repo
+ * cloned at /home/... and /Users/... (or under different directory names)
+ * yields the same slug, so a synced memory store serves one project dir.
+ */
+export function slugForRemote(url: string): string {
+  const s = url.trim().toLowerCase().replace(/\.git$/, "");
+  const urlForm = s.match(/^[a-z][a-z0-9+.-]*:\/\/(?:[^/@]+@)?([^/:?]+)(?::\d+)?\/(.+)$/);
+  const scpForm = s.match(/^(?:[^@/]+@)?([^/:]+):(.+)$/);
+  const hostPath = urlForm ? `${urlForm[1]}/${urlForm[2]}` : scpForm ? `${scpForm[1]}/${scpForm[2]}` : null;
+  if (!hostPath) return slugForPath(s); // local-path remotes: path-based slug
+  return hostPath
+    .split("/")
+    .flatMap((part) => part.split(/[^a-z0-9]+/))
+    .filter((part) => part.length > 0)
+    .join("-");
+}
+
 export async function resolveProjectSlug(cwd: string): Promise<string> {
+  const { execFile } = await import("node:child_process");
+  const { promisify } = await import("node:util");
+  const run = promisify(execFile);
+  // Prefer the origin remote: stable across machines and checkout names.
   try {
-    const { execFile } = await import("node:child_process");
-    const { promisify } = await import("node:util");
-    const { stdout } = await promisify(execFile)("git", ["rev-parse", "--show-toplevel"], { cwd });
+    const { stdout } = await run("git", ["remote", "get-url", "origin"], { cwd });
+    return slugForRemote(stdout.trim());
+  } catch {
+    // no origin remote (or not a git repo) — fall through
+  }
+  try {
+    const { stdout } = await run("git", ["rev-parse", "--show-toplevel"], { cwd });
     return slugForPath(stdout.trim());
   } catch {
     return slugForPath(cwd);
