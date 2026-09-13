@@ -222,8 +222,9 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "memory_read",
     label: "Memory Read",
-    description: "Read full memory contents by id (1-5 ids); bumps usage",
-    promptSnippet: "Read full memory entries by id",
+    description:
+      "Read full memory contents by id (1-5 ids, e.g. mem-09839b44); the bare 8-hex form is also accepted; bumps usage",
+    promptSnippet: "Read full memory entries by id (e.g. mem-09839b44)",
     parameters: Type.Object({
       ids: Type.Array(Type.String(), { minItems: 1, maxItems: 5 }),
     }),
@@ -236,8 +237,8 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "memory_forget",
     label: "Memory Forget",
-    description: "Archive a wrong or obsolete memory by id",
-    promptSnippet: "Archive a memory by id",
+    description: "Archive a wrong or obsolete memory by id (e.g. mem-09839b44)",
+    promptSnippet: "Archive a memory by id (e.g. mem-09839b44)",
     parameters: Type.Object({ id: Type.String() }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
       if (!store) throw new Error("memory store not initialized");

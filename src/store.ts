@@ -115,6 +115,16 @@ export function indexLine(m: MemoryFile): string {
   return `- [${m.id}] (${m.type}${uses}) ${m.title}`;
 }
 
+// Callers (notably models) sometimes pass a memory id without the canonical
+// "mem-" prefix, or in a different case. Normalize those to the canonical form
+// so a valid id always resolves; return null for anything that is not an id, so
+// an arbitrary string can never be turned into a filename.
+const MEMORY_ID_RE = /^(?:mem-)?([0-9a-f]{8})$/i;
+export function normalizeMemoryId(id: string): string | null {
+  const match = MEMORY_ID_RE.exec(id.trim());
+  return match ? `mem-${match[1].toLowerCase()}` : null;
+}
+
 export function slugForPath(p: string): string {
   return p
     .toLowerCase()
@@ -263,9 +273,11 @@ export class MarkdownStore {
   }
 
   async get(id: string): Promise<MemoryFile | undefined> {
+    const canonical = normalizeMemoryId(id);
+    if (!canonical) return undefined;
     for (const scope of ["project", "global"] as const) {
       try {
-        const raw = await readFile(join(this.scopeDir(scope), this.fileTitle(id)), "utf8");
+        const raw = await readFile(join(this.scopeDir(scope), this.fileTitle(canonical)), "utf8");
         return parseMemoryFile(raw, scope) ?? undefined;
       } catch {
         // try next scope
@@ -314,18 +326,20 @@ export class MarkdownStore {
   }
 
   async moveToArchive(id: string, reason?: string): Promise<boolean> {
+    const canonical = normalizeMemoryId(id);
+    if (!canonical) return false;
     for (const scope of ["project", "global"] as const) {
-      const src = join(this.scopeDir(scope), this.fileTitle(id));
+      const src = join(this.scopeDir(scope), this.fileTitle(canonical));
       let raw: string;
       try {
         raw = await readFile(src, "utf8");
       } catch {
         continue;
       }
-      const dst = join(this.archiveDir(scope), this.fileTitle(id));
+      const dst = join(this.archiveDir(scope), this.fileTitle(canonical));
       await rename(src, dst);
       if (reason !== undefined) {
-        const hash = createHash("sha256").update(reason + id).digest("hex").slice(0, 8);
+        const hash = createHash("sha256").update(reason + canonical).digest("hex").slice(0, 8);
         await writeFile(join(this.archiveDir(scope), `.reason-${hash}`), reason, "utf8");
       }
       await this.regenerateIndex(scope);

@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { MarkdownStore } from "../src/store.js";
+import { MarkdownStore, normalizeMemoryId } from "../src/store.js";
 
 let root: string;
 let store: MarkdownStore;
@@ -38,6 +38,31 @@ describe("MarkdownStore", () => {
     expect((await store.get(p.id))?.scope).toBe("project");
     expect((await store.get(g.id))?.scope).toBe("global");
     expect(await store.get("mem-00000000")).toBeUndefined();
+  });
+
+  it("get accepts a bare 8-hex id without the mem- prefix", async () => {
+    const f = await store.save(mem());
+    const bare = f.id.slice("mem-".length);
+    expect((await store.get(bare))?.id).toBe(f.id);
+  });
+
+  it("get rejects malformed ids instead of guessing", async () => {
+    const f = await store.save(mem());
+    const bare = f.id.slice("mem-".length);
+    expect(await store.get(bare.slice(0, 7))).toBeUndefined(); // too short
+    expect(await store.get("mem-zzzzzzzz")).toBeUndefined(); // not hex
+    expect(await store.get(`${bare}.md`)).toBeUndefined(); // filename, not id
+  });
+
+  it("moveToArchive accepts a bare 8-hex id", async () => {
+    const f = await store.save(mem());
+    expect(await store.moveToArchive(f.id.slice("mem-".length), "obsolete")).toBe(true);
+    expect(await store.get(f.id)).toBeUndefined();
+  });
+
+  it("moveToArchive returns false for a malformed id", async () => {
+    await store.save(mem());
+    expect(await store.moveToArchive("not-an-id", "obsolete")).toBe(false);
   });
 
   it("list sorts by strength desc and skips corrupt files", async () => {
@@ -122,5 +147,24 @@ describe("MarkdownStore", () => {
     );
     const lines2 = await store.indexLines("project");
     expect(lines2.length).toBeGreaterThanOrEqual(10);
+  });
+});
+
+describe("normalizeMemoryId", () => {
+  it("adds the mem- prefix to a bare 8-hex id", () => {
+    expect(normalizeMemoryId("09839b44")).toBe("mem-09839b44");
+  });
+
+  it("leaves a canonical id unchanged and lowercases it", () => {
+    expect(normalizeMemoryId("mem-09839b44")).toBe("mem-09839b44");
+    expect(normalizeMemoryId("MEM-0983ABCD")).toBe("mem-0983abcd");
+  });
+
+  it("returns null for anything that is not an 8-hex id", () => {
+    expect(normalizeMemoryId("09839b4")).toBeNull(); // too short
+    expect(normalizeMemoryId("09839b444")).toBeNull(); // too long
+    expect(normalizeMemoryId("mem-zzzzzzzz")).toBeNull(); // not hex
+    expect(normalizeMemoryId("09839b44.md")).toBeNull(); // filename
+    expect(normalizeMemoryId("../secret")).toBeNull(); // path traversal
   });
 });

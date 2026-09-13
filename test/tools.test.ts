@@ -236,12 +236,27 @@ describe("handleMemoryRead", () => {
     expect(res.content[0].text).toContain("the body text");
     expect((await store.get(saved.id))?.useCount).toBe(1);
   });
+
+  it("reads a memory when the id omits the mem- prefix", async () => {
+    // Models sometimes pass only the 8 hex chars; the tool must still resolve it.
+    const saved = await store.save({ type: "fact", title: "T", body: "the body text" });
+    const res = await handleMemoryRead(store, { ids: [saved.id.slice("mem-".length)] });
+    expect(res.content[0].text).toContain("the body text");
+    expect(res.content[0].text).toContain(saved.id);
+  });
 });
 
 describe("handleMemoryForget", () => {
   it("archives the memory", async () => {
     const saved = await store.save({ type: "fact", title: "T", body: "b" });
     const res = await handleMemoryForget(store, { id: saved.id });
+    expect(res.details.forgotten).toBe(true);
+    expect(await store.get(saved.id)).toBeUndefined();
+  });
+
+  it("archives when the id omits the mem- prefix", async () => {
+    const saved = await store.save({ type: "fact", title: "T", body: "b" });
+    const res = await handleMemoryForget(store, { id: saved.id.slice("mem-".length) });
     expect(res.details.forgotten).toBe(true);
     expect(await store.get(saved.id)).toBeUndefined();
   });
