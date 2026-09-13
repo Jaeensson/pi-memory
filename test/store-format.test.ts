@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -146,7 +146,9 @@ describe("resolveProjectSlug", () => {
 
   it("falls back to the repo root path slug when no remote exists", async () => {
     const repo = makeGitRepo();
-    expect(await resolveProjectSlug(repo)).toBe(slugForPath(repo));
+    // git rev-parse --show-toplevel returns the canonical path; on macOS the temp
+    // dir (/var/…) is a symlink to /private/var, so compare against the realpath.
+    expect(await resolveProjectSlug(repo)).toBe(slugForPath(realpathSync(repo)));
   });
 
   it("falls back to the cwd path slug outside a git repo", async () => {
