@@ -10,8 +10,11 @@ import { join } from "node:path";
 
 // File format, slug logic, and the MarkdownStore persistence layer.
 
-export type MemoryType = "decision" | "fact" | "lesson";
+export type MemoryType = "decision" | "fact" | "lesson" | "snapshot";
 export type MemoryScope = "project" | "global";
+
+/** Lifecycle of one memory file. Absent frontmatter means "active" (legacy files). */
+export type MemoryStatus = "active" | "superseded" | "expired";
 
 export interface MemoryMeta {
   id: string;
@@ -25,6 +28,20 @@ export interface MemoryMeta {
   pinned: boolean;
   revision: number;
   previousTitles: string[];
+  /** Lifecycle status; undefined is treated as "active". */
+  status?: MemoryStatus;
+  /** Ids this memory replaces (cross-entry supersession, written by memory_save). */
+  supersedes?: string[];
+  /** Id of the memory that replaced this one; set together with status: "superseded". */
+  supersededBy?: string;
+  /** Cheap evidence the claim rests on: a commit sha, file:line, or "decision". */
+  anchor?: string;
+  /** ISO timestamp of the last memory_verify re-check. */
+  verifiedAt?: string;
+  /** ISO timestamp after which a `snapshot` memory is stale and must be refreshed. */
+  expiresAfter?: string;
+  /** Unknown frontmatter fields, preserved verbatim across read/write round-trips. */
+  extra?: Record<string, unknown>;
 }
 
 export interface MemoryFile extends MemoryMeta {
@@ -43,13 +60,28 @@ const META_ORDER: (keyof MemoryMeta)[] = [
   "pinned",
   "revision",
   "previousTitles",
+  "status",
+  "supersedes",
+  "supersededBy",
+  "anchor",
+  "verifiedAt",
+  "expiresAfter",
 ];
 
+const KNOWN_KEYS: ReadonlySet<string> = new Set(META_ORDER as string[]);
+
 export function serializeMemoryFile(m: MemoryFile): string {
-  const lines = META_ORDER.map((key) => {
+  const lines: string[] = [];
+  for (const key of META_ORDER) {
     const value = m[key];
-    return `${key}: ${JSON.stringify(value)}`;
-  });
+    if (value === undefined) continue; // optional fields stay absent, not "undefined"
+    lines.push(`${key}: ${JSON.stringify(value)}`);
+  }
+  // Preserve unfamiliar frontmatter so a future field survives our read/write cycle.
+  for (const [key, value] of Object.entries(m.extra ?? {})) {
+    if (KNOWN_KEYS.has(key)) continue; // a known field always wins over a same-named extra
+    lines.push(`${key}: ${JSON.stringify(value)}`);
+  }
   return `---\n${lines.join("\n")}\n---\n${m.body.replace(/\n?$/, "\n")}`;
 }
 
@@ -62,18 +94,26 @@ export function parseMemoryFile(raw: string, fallbackScope: MemoryScope): Memory
     const idx = line.indexOf(":");
     if (idx <= 0) continue;
     const key = line.slice(0, idx).trim();
-    let value: unknown = line.slice(idx + 1).trim();
-    try {
-      value = JSON.parse(value as string);
-    } catch {
-      return null; // all our values are JSON scalars/arrays
+    const rawValue = line.slice(idx + 1).trim();
+    if (KNOWN_KEYS.has(key)) {
+      try {
+        fields[key] = JSON.parse(rawValue);
+      } catch {
+        return null; // known fields are always JSON scalars/arrays
+      }
+    } else {
+      // Unknown field: keep the parsed value if it is JSON, otherwise the raw text.
+      try {
+        fields[key] = JSON.parse(rawValue);
+      } catch {
+        fields[key] = rawValue;
+      }
     }
-    fields[key] = value;
   }
   const id = fields.id;
   if (typeof id !== "string" || !/^mem-[0-9a-f]{8}$/.test(id)) return null;
   const type = fields.type;
-  if (type !== "decision" && type !== "fact" && type !== "lesson") return null;
+  if (type !== "decision" && type !== "fact" && type !== "lesson" && type !== "snapshot") return null;
   const scope =
     fields.scope === undefined
       ? fallbackScope // field absent → caller's default
@@ -94,6 +134,29 @@ export function parseMemoryFile(raw: string, fallbackScope: MemoryScope): Memory
   if (typeof fields.title !== "string") return null;
   const previousTitles = fields.previousTitles;
   if (!Array.isArray(previousTitles) || previousTitles.some((t) => typeof t !== "string")) return null;
+
+  const status = fields.status;
+  if (status !== undefined && status !== "active" && status !== "superseded" && status !== "expired") {
+    return null;
+  }
+  const supersedes = fields.supersedes;
+  if (supersedes !== undefined && (!Array.isArray(supersedes) || supersedes.some((s) => typeof s !== "string"))) {
+    return null;
+  }
+  const supersededBy = fields.supersededBy;
+  if (supersededBy !== undefined && typeof supersededBy !== "string") return null;
+  const anchor = fields.anchor;
+  if (anchor !== undefined && typeof anchor !== "string") return null;
+  const verifiedAt = fields.verifiedAt;
+  if (verifiedAt !== undefined && !isIsoUtc(verifiedAt)) return null;
+  const expiresAfter = fields.expiresAfter;
+  if (expiresAfter !== undefined && !isIsoUtc(expiresAfter)) return null;
+
+  const extra: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(fields)) {
+    if (!KNOWN_KEYS.has(key)) extra[key] = value;
+  }
+
   return {
     id,
     type,
@@ -106,8 +169,47 @@ export function parseMemoryFile(raw: string, fallbackScope: MemoryScope): Memory
     pinned: fields.pinned === true,
     revision: typeof fields.revision === "number" ? fields.revision : 0,
     previousTitles: previousTitles as string[],
+    ...(status !== undefined ? { status } : {}),
+    ...(supersedes !== undefined ? { supersedes: supersedes as string[] } : {}),
+    ...(supersededBy !== undefined ? { supersededBy } : {}),
+    ...(anchor !== undefined ? { anchor } : {}),
+    ...(verifiedAt !== undefined ? { verifiedAt } : {}),
+    ...(expiresAfter !== undefined ? { expiresAfter } : {}),
+    ...(Object.keys(extra).length > 0 ? { extra } : {}),
     body: body.replace(/\n$/, ""), // drop the single newline serializeMemoryFile appends
   };
+}
+
+/** Absent status means active (files written before supersession existed). */
+export function statusOf(m: MemoryFile): MemoryStatus {
+  return m.status ?? "active";
+}
+
+/**
+ * Effective status including time-based snapshot expiry. A `snapshot` past its
+ * `expiresAfter` reads as expired even though its frontmatter still says active,
+ * so it leaves the index/injection without waiting for a rewrite.
+ */
+export function effectiveStatus(m: MemoryFile, now: Date = new Date()): MemoryStatus {
+  const status = statusOf(m);
+  if (status !== "active") return status;
+  if (m.type === "snapshot" && m.expiresAfter !== undefined && Date.parse(m.expiresAfter) <= now.getTime()) {
+    return "expired";
+  }
+  return "active";
+}
+
+/** Active = present in the index/injection and eligible for pruning. */
+export function isActive(m: MemoryFile, now: Date = new Date()): boolean {
+  return effectiveStatus(m, now) === "active";
+}
+
+/**
+ * Index ordering: verified entries get a small boost over equal-strength peers so
+ * re-checked truth surfaces first, but the usage-based strength still dominates.
+ */
+function indexRank(m: MemoryFile): number {
+  return m.strength + (m.verifiedAt !== undefined ? 0.1 : 0);
 }
 
 export function indexLine(m: MemoryFile): string {
@@ -190,6 +292,9 @@ export class MarkdownStore {
   private limits: IndexLimits;
   private corruptSkipped = 0;
 
+  /** File paths already counted as corrupt, so repeated reads do not inflate corruptCount. */
+  private readonly corruptSeen = new Set<string>();
+
   /** Serializes index writes so parallel mutations cannot race regenerateIndex. */
   private indexQueue: Promise<void> = Promise.resolve();
 
@@ -250,6 +355,9 @@ export class MarkdownStore {
     body: string;
     scope?: MemoryScope;
     pinned?: boolean;
+    supersedes?: string[];
+    anchor?: string;
+    expiresAfter?: string;
   }): Promise<MemoryFile> {
     const scope = input.scope ?? "project";
     const now = new Date().toISOString();
@@ -265,6 +373,11 @@ export class MarkdownStore {
       pinned: input.pinned === true,
       revision: 0,
       previousTitles: [],
+      ...(input.supersedes !== undefined && input.supersedes.length > 0
+        ? { supersedes: [...input.supersedes] }
+        : {}),
+      ...(input.anchor !== undefined ? { anchor: input.anchor } : {}),
+      ...(input.expiresAfter !== undefined ? { expiresAfter: input.expiresAfter } : {}),
       body: input.body,
     };
     await writeAtomic(join(this.scopeDir(scope), this.fileTitle(file.id)), serializeMemoryFile(file));
@@ -317,12 +430,37 @@ export class MarkdownStore {
         const raw = await readFile(join(dir, name), "utf8");
         const parsed = parseMemoryFile(raw, scope);
         if (parsed) files.push(parsed);
-        else if (name !== "INDEX.md") this.corruptSkipped += 1; // generated index is not a memory file
+        else if (name !== "INDEX.md") {
+          // generated index is not a memory file; count each bad path once, not per read
+          const key = join(dir, name);
+          if (!this.corruptSeen.has(key)) {
+            this.corruptSeen.add(key);
+            this.corruptSkipped += 1;
+          }
+        }
       } catch {
         // unreadable file: skip
       }
     }
     return files;
+  }
+
+  /**
+   * Active memories for one scope, read from disk once. Used by the injection
+   * path so a render does not re-read the whole store per lane.
+   */
+  async activeFiles(scope: MemoryScope, now: Date = new Date()): Promise<MemoryFile[]> {
+    return (await this.listDir(this.scopeDir(scope), scope))
+      .filter((f) => isActive(f, now))
+      .sort((a, b) => indexRank(b) - indexRank(a) || a.id.localeCompare(b.id));
+  }
+
+  /**
+   * Index lines for active memories only, computed from files at call time so a
+   * time-expired snapshot is excluded from injection without waiting for a rewrite.
+   */
+  async activeIndexLines(scope: MemoryScope, now: Date = new Date()): Promise<string[]> {
+    return (await this.activeFiles(scope, now)).map(indexLine);
   }
 
   async moveToArchive(id: string, reason?: string): Promise<boolean> {
@@ -370,9 +508,7 @@ export class MarkdownStore {
   }
 
   private async regenerateIndexUnlocked(scope: MemoryScope): Promise<void> {
-    const files = (await this.listDir(this.scopeDir(scope), scope)).sort(
-      (a, b) => b.strength - a.strength || a.id.localeCompare(b.id),
-    );
+    const files = await this.activeFiles(scope);
     const lines: string[] = [];
     let bytes = 0;
     for (const f of files) {

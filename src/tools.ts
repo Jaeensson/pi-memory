@@ -1,5 +1,5 @@
-import type { MemoryScope, MemoryType } from "./store.js";
-import { MarkdownStore, type MemoryFile } from "./store.js";
+import type { MemoryScope, MemoryStatus, MemoryType } from "./store.js";
+import { MarkdownStore, effectiveStatus, isActive, normalizeMemoryId, type MemoryFile } from "./store.js";
 
 export type ToolResult = {
   content: { type: "text"; text: string }[];
@@ -59,28 +59,122 @@ export async function dedupCheck(
 
 // ---------- handlers ----------
 
+const SNAPSHOT_ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{3})?Z$/;
+// A score at or above this is a near-copy worth blocking on; below it we still
+// report overlaps but let the save through (they may be legitimately related).
+const OVERLAP_STRONG = 6;
+const OVERLAP_MIN = 3;
+
+const rejectedSave = (reason: string, details: Record<string, unknown> = {}): ToolResult => ({
+  content: [{ type: "text", text: reason }],
+  details: { saved: false, reason, ...details },
+});
+
 export async function handleMemorySave(
   store: MarkdownStore,
-  params: { type: MemoryType; title: string; body: string; scope?: "project" | "global" },
+  params: {
+    type: MemoryType;
+    title: string;
+    body: string;
+    scope?: "project" | "global";
+    pinned?: boolean;
+    supersedes?: string[];
+    anchor?: string;
+    expiresAfter?: string;
+  },
 ): Promise<ToolResult> {
   const scan = secretScan(`${params.title}\n${params.body}`);
-  if (!scan.ok) {
-    return { content: [{ type: "text", text: scan.reason ?? "rejected" }], details: { saved: false, reason: scan.reason } };
+  if (!scan.ok) return rejectedSave(scan.reason ?? "rejected");
+
+  // A snapshot is time-stamped state, not durable truth: it must say what it is
+  // anchored to and when it stops being current, or it rots into a false fact.
+  if (params.type === "snapshot") {
+    if (params.anchor === undefined || params.anchor.trim() === "") {
+      return rejectedSave("rejected: a snapshot needs an `anchor` (commit sha or file:line)");
+    }
+    if (
+      params.expiresAfter === undefined ||
+      !SNAPSHOT_ISO.test(params.expiresAfter) ||
+      Number.isNaN(Date.parse(params.expiresAfter))
+    ) {
+      return rejectedSave("rejected: a snapshot needs `expiresAfter` as an ISO-8601 UTC timestamp");
+    }
   }
+
+  const supersedes = [
+    ...new Set(
+      (params.supersedes ?? [])
+        .map((id) => normalizeMemoryId(id))
+        .filter((id): id is string => id !== null),
+    ),
+  ];
+  const scope = params.scope ?? "project";
+
   const dup = await dedupCheck(store, params);
-  if (dup) {
+  if (dup && isActive(dup) && !supersedes.includes(dup.id)) {
     return {
       content: [{
         type: "text",
-        text: `Similar memory exists: [${dup.id}] ${dup.title} — use /memory to edit or rephrase.`,
+        text: `Similar memory exists: [${dup.id}] ${dup.title} — resave with supersedes: ["${dup.id}"] to replace it, or rephrase.`,
       }],
       details: { saved: false, duplicate: true, id: dup.id },
     };
   }
-  const file = await store.save(params);
+
+  // Cheapest fix for the observed near-copies: the same lexical scorer search
+  // uses runs at save time and hands the model the overlapping ids instead of
+  // silently appending a fourth copy of the same decision.
+  const candidates = (await store.all()).filter(
+    (f) => f.scope === scope && f.type === params.type && isActive(f),
+  );
+  const overlaps = scoreFiles(candidates, `${params.title}\n${params.body}`)
+    .filter((o) => o.score >= OVERLAP_MIN)
+    .sort((a, b) => b.score - a.score || a.file.id.localeCompare(b.file.id))
+    .slice(0, 3)
+    .map((o) => ({ id: o.file.id, title: o.file.title, score: o.score }));
+  const strong = overlaps.filter((o) => o.score >= OVERLAP_STRONG && !supersedes.includes(o.id));
+  if (strong.length > 0) {
+    const list = strong.map((o) => `- [${o.id}] ${o.title}`).join("\n");
+    return {
+      content: [{
+        type: "text",
+        text:
+          `Not saved: ${strong.length > 1 ? "overlapping memories exist" : "an overlapping memory exists"}:\n${list}\n` +
+          `If this replaces ${strong.length > 1 ? "them" : "it"}, resave with supersedes: [${strong
+            .map((o) => `"${o.id}"`)
+            .join(", ")}]; otherwise rephrase so the two are distinguishable.`,
+      }],
+      details: { saved: false, duplicate: false, overlaps: strong },
+    };
+  }
+
+  const file = await store.save({ ...params, supersedes });
+  const superseded: string[] = [];
+  const supersedesNotFound: string[] = [];
+  for (const id of supersedes) {
+    const target = await store.get(id);
+    if (!target) {
+      supersedesNotFound.push(id);
+      continue;
+    }
+    if (!isActive(target)) continue;
+    target.status = "superseded";
+    target.supersededBy = file.id;
+    await store.update(target);
+    superseded.push(target.id);
+  }
+  const details: Record<string, unknown> = { saved: true, id: file.id, scope: file.scope };
+  if (superseded.length > 0) details.superseded = superseded;
+  if (supersedesNotFound.length > 0) details.supersedesNotFound = supersedesNotFound;
+  if (overlaps.length > 0) details.overlaps = overlaps;
+  // details are UI-only; the model only sees content, so surface weak overlaps here too.
+  const advisory =
+    overlaps.length > 0
+      ? `\nRelated: ${overlaps.map((o) => `[${o.id}] ${o.title}`).join("; ")}. If this supersedes one, resave with supersedes.`
+      : "";
   return {
-    content: [{ type: "text", text: `Saved ${file.scope} memory ${file.id}: ${file.title}` }],
-    details: { saved: true, id: file.id, scope: file.scope },
+    content: [{ type: "text", text: `Saved ${file.scope} memory ${file.id}: ${file.title}${advisory}` }],
+    details,
   };
 }
 
@@ -145,27 +239,22 @@ function matchTerm(termStem: string, tokenStem: string): MatchKind {
   return "none";
 }
 
-export async function handleMemorySearch(
-  store: MarkdownStore,
-  params: { query: string; scope?: "project" | "global" | "all"; type?: MemoryType; limit?: number },
-): Promise<ToolResult> {
-  const termStems = [...new Set(tokenize(params.query).map(stem))];
-  if (termStems.length === 0) return text("No usable search terms.");
-  const scopes: MemoryScope[] =
-    params.scope === "project" ? ["project"] : params.scope === "global" ? ["global"] : ["project", "global"];
-  const limit = params.limit ?? 10;
-  const candidates: { file: MemoryFile; titleStems: string[]; bodyStems: string[] }[] = [];
-  for (const scope of scopes) {
-    for (const file of await store.list(scope)) {
-      if (params.type && file.type !== params.type) continue;
-      candidates.push({
-        file,
-        titleStems: tokenize(file.title).map(stem),
-        // previousTitles are searchable at body weight: superseded titles keep old vocabulary findable
-        bodyStems: tokenize(`${file.body}\n${file.previousTitles.join("\n")}`).map(stem),
-      });
-    }
-  }
+/**
+ * Lexical relevance scorer shared by search and save-time overlap detection.
+ * Pure: takes files + query, returns scored candidates (unsorted).
+ */
+export function scoreFiles(
+  files: MemoryFile[],
+  query: string,
+): { file: MemoryFile; score: number }[] {
+  const termStems = [...new Set(tokenize(query).map(stem))];
+  if (termStems.length === 0 || files.length === 0) return [];
+  const candidates = files.map((file) => ({
+    file,
+    titleStems: tokenize(file.title).map(stem),
+    // previousTitles are searchable at body weight: superseded titles keep old vocabulary findable
+    bodyStems: tokenize(`${file.body}\n${file.previousTitles.join("\n")}`).map(stem),
+  }));
   // Noise gate: a term present in most bodies carries no discrimination, so it earns
   // no body points (title points are unaffected). Rare single-body hits stay visible.
   const bodyDf = new Map<string, number>();
@@ -189,11 +278,41 @@ export async function handleMemorySearch(
     }
     if (score > 0) scored.push({ file: c.file, score });
   }
-  scored.sort((a, b) => b.score - a.score || b.file.strength - a.file.strength);
+  return scored;
+}
+
+export async function handleMemorySearch(
+  store: MarkdownStore,
+  params: { query: string; scope?: "project" | "global" | "all"; type?: MemoryType; limit?: number },
+): Promise<ToolResult> {
+  const scopes: MemoryScope[] =
+    params.scope === "project" ? ["project"] : params.scope === "global" ? ["global"] : ["project", "global"];
+  const limit = params.limit ?? 10;
+  const files: MemoryFile[] = [];
+  for (const scope of scopes) {
+    for (const file of await store.list(scope)) {
+      if (params.type && file.type !== params.type) continue;
+      files.push(file);
+    }
+  }
+  // Inactive entries stay searchable for audit, but a large penalty keeps them
+  // below every active hit; the line marks why so a stale hit is never mistaken
+  // for current.
+  const scored = scoreFiles(files, params.query)
+    .map(({ file, score }) => ({ file, score: isActive(file) ? score : score - 1000 }))
+    .sort((a, b) => b.score - a.score || b.file.strength - a.file.strength);
   const hits = scored.slice(0, limit);
   if (hits.length === 0) return text("No matching memories.");
   return text(
-    ["Matching memories (id | type | title):", ...hits.map(({ file }) => `- [${file.id}] ${file.type} | ${file.title}`)].join("\n"),
+    [
+      "Matching memories (id | type | title):",
+      ...hits.map(({ file }) => {
+        const status = effectiveStatus(file);
+        const suffix =
+          status === "active" ? "" : ` [${status}${file.supersededBy ? ` by ${file.supersededBy}` : ""}]`;
+        return `- [${file.id}] ${file.type} | ${file.title}${suffix}`;
+      }),
+    ].join("\n"),
   );
 }
 
@@ -219,10 +338,94 @@ export async function handleMemoryRead(store: MarkdownStore, params: { ids: stri
   return text(parts.join("\n\n"));
 }
 
-export async function handleMemoryForget(store: MarkdownStore, params: { id: string }): Promise<ToolResult> {
-  const ok = await store.moveToArchive(params.id, "forgotten via memory_forget");
+export async function handleMemoryForget(
+  store: MarkdownStore,
+  params: { id: string; reason?: string; supersededBy?: string },
+): Promise<ToolResult> {
+  // The tool schema requires `reason`; this default only covers direct callers
+  // (tests, older transcripts) so archiving never loses the field entirely.
+  const reason = params.reason?.trim() ? params.reason.trim() : "forgotten via memory_forget (no reason given)";
+  if (params.supersededBy !== undefined) {
+    const file = await store.get(params.id);
+    if (file) {
+      file.status = "superseded";
+      file.supersededBy = params.supersededBy;
+      await store.update(file);
+    }
+  }
+  const note = params.supersededBy !== undefined ? `${reason}\nsupersededBy: ${params.supersededBy}` : reason;
+  const ok = await store.moveToArchive(params.id, note);
   return {
-    content: [{ type: "text", text: ok ? `Archived ${params.id}.` : `${params.id} not found.` }],
-    details: { forgotten: ok },
+    content: [{ type: "text", text: ok ? `Archived ${params.id}: ${reason}` : `${params.id} not found.` }],
+    details: { forgotten: ok, reason, ...(params.supersededBy !== undefined ? { supersededBy: params.supersededBy } : {}) },
+  };
+}
+
+/**
+ * Stamp a memory as re-checked against the repo. Verification is what makes
+ * "verified beats merely-cited" ranking possible without re-reading every file.
+ */
+export async function handleMemoryVerify(
+  store: MarkdownStore,
+  params: { id: string; anchor?: string },
+  now: Date = new Date(),
+): Promise<ToolResult> {
+  const file = await store.get(params.id);
+  if (!file) return text(`${params.id} not found`);
+  file.verifiedAt = now.toISOString();
+  if (params.anchor !== undefined) file.anchor = params.anchor;
+  await store.update(file);
+  return {
+    content: [{
+      type: "text",
+      text: `Verified ${file.id} at ${file.verifiedAt}${file.anchor ? ` (anchor: ${file.anchor})` : ""}.`,
+    }],
+    details: { verified: true, id: file.id, verifiedAt: file.verifiedAt, ...(file.anchor ? { anchor: file.anchor } : {}) },
+  };
+}
+
+/**
+ * Paged enumeration for auditing the store without reading files off disk.
+ * Unlike search, this lists entries and their metadata; bodies are never returned.
+ */
+export async function handleMemoryList(
+  store: MarkdownStore,
+  params: {
+    scope?: "project" | "global" | "all";
+    type?: MemoryType;
+    status?: MemoryStatus | "all";
+    limit?: number;
+    offset?: number;
+    includeArchive?: boolean;
+  },
+): Promise<ToolResult> {
+  const scopes: MemoryScope[] =
+    params.scope === "project" ? ["project"] : params.scope === "global" ? ["global"] : ["project", "global"];
+  const files: MemoryFile[] = [];
+  for (const scope of scopes) {
+    files.push(...(await store.list(scope, { includeArchive: params.includeArchive === true })));
+  }
+  const filtered = files.filter((f) => {
+    if (params.type && f.type !== params.type) return false;
+    if (params.status && params.status !== "all" && effectiveStatus(f) !== params.status) return false;
+    return true;
+  });
+  filtered.sort((a, b) => b.strength - a.strength || a.id.localeCompare(b.id));
+  const offset = Math.max(0, params.offset ?? 0);
+  const limit = Math.max(1, params.limit ?? 50);
+  const page = filtered.slice(offset, offset + limit);
+  const lines = page.map((f) => {
+    let line = `- [${f.id}] ${f.type} | ${f.title} | s=${f.strength} | ${effectiveStatus(f)}`;
+    if (f.anchor) line += ` | anchor=${f.anchor}`;
+    if (f.verifiedAt) line += ` | verified=${f.verifiedAt}`;
+    if (f.supersededBy) line += ` | supersededBy=${f.supersededBy}`;
+    return line;
+  });
+  return {
+    content: [{
+      type: "text",
+      text: [`Memories ${offset}-${offset + page.length} of ${filtered.length}:`, ...lines].join("\n"),
+    }],
+    details: { total: filtered.length, offset, limit, count: page.length },
   };
 }

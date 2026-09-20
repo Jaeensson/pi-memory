@@ -1,9 +1,11 @@
 import type { MemoryConfig } from "./config.js";
-import type { MarkdownStore, MemoryFile } from "./store.js";
+import { indexLine, type MarkdownStore, type MemoryFile } from "./store.js";
 
 export const POLICY_TEXT =
   "Use memory_search <query> to find more. Save durable decisions, facts, and " +
-  "lessons with memory_save — save immediately when the user corrects you.";
+  "lessons with memory_save — save immediately when the user corrects you. When a new " +
+  "decision replaces an old memory, pass supersedes: [id]; re-check important claims " +
+  "with memory_verify.";
 
 export function estimateTokens(text: string): number {
   return Math.ceil(text.length / 4);
@@ -53,13 +55,20 @@ export async function gatherInjection(
   store: MarkdownStore,
   cfg: MemoryConfig,
 ): Promise<InjectionInput> {
-  const pinned = (await store.all())
+  const now = new Date();
+  // One directory read per scope serves both the pinned lane and the index lane,
+  // so the hot path does not re-read the whole store per lane.
+  const project = await store.activeFiles("project", now);
+  const global = cfg.globalEnabled ? await store.activeFiles("global", now) : [];
+  const pinned = [...project, ...global]
     .filter((f) => f.pinned)
     .sort((a, b) => b.lastUsed.localeCompare(a.lastUsed));
   return {
     pinned,
-    projectIndex: await store.indexLines("project"),
-    globalIndex: cfg.globalEnabled ? await store.indexLines("global") : [],
+    // Computed from files (not the on-disk INDEX.md) so a snapshot that just passed
+    // its expiresAfter drops out immediately, and superseded entries never inject.
+    projectIndex: project.map(indexLine),
+    globalIndex: global.map(indexLine),
   };
 }
 

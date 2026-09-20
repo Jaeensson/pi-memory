@@ -14,9 +14,11 @@ import {
 import { MarkdownStore } from "./store.js";
 import {
   handleMemoryForget,
+  handleMemoryList,
   handleMemoryRead,
   handleMemorySave,
   handleMemorySearch,
+  handleMemoryVerify,
 } from "./tools.js";
 import { resolveProjectSlug } from "./store.js";
 
@@ -186,12 +188,21 @@ export default function (pi: ExtensionAPI) {
     promptSnippet: "Save a durable decision/fact/lesson to long-term memory",
     promptGuidelines: [
       "Use memory_save to persist durable project decisions, facts, and lessons from mistakes. Call it immediately when the user corrects your approach — corrections must not wait for later.",
+      "When the new memory replaces an existing one, pass its id in supersedes so the old entry is retired (kept on disk for audit) instead of competing for injection. If the result reports overlapping ids, resave with supersedes or rephrase.",
     ],
     parameters: Type.Object({
-      type: StringEnum(["decision", "fact", "lesson"] as const),
+      type: StringEnum(["decision", "fact", "lesson", "snapshot"] as const),
       title: Type.String({ description: "One-line specific summary" }),
       body: Type.String({ description: "2-6 sentences including the why" }),
       scope: Type.Optional(StringEnum(["project", "global"] as const)),
+      pinned: Type.Optional(Type.Boolean({ description: "Always inject this memory's full body (prohibitions/standing rules)" })),
+      supersedes: Type.Optional(
+        Type.Array(Type.String(), { description: "Ids this memory replaces; targets are marked superseded" }),
+      ),
+      anchor: Type.Optional(Type.String({ description: "Cheap evidence: a commit sha, file:line, or 'decision'" })),
+      expiresAfter: Type.Optional(
+        Type.String({ description: "snapshot only: ISO-8601 UTC time after which the snapshot is stale" }),
+      ),
     }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
       if (!store) throw new Error("memory store not initialized");
@@ -210,7 +221,7 @@ export default function (pi: ExtensionAPI) {
     parameters: Type.Object({
       query: Type.String(),
       scope: Type.Optional(StringEnum(["project", "global", "all"] as const)),
-      type: Type.Optional(StringEnum(["decision", "fact", "lesson"] as const)),
+      type: Type.Optional(StringEnum(["decision", "fact", "lesson", "snapshot"] as const)),
       limit: Type.Optional(Type.Number()),
     }),
     async execute(_id, params) {
@@ -223,10 +234,10 @@ export default function (pi: ExtensionAPI) {
     name: "memory_read",
     label: "Memory Read",
     description:
-      "Read full memory contents by id (1-5 ids, e.g. mem-09839b44); the bare 8-hex form is also accepted; bumps usage",
+      "Read full memory contents by id (1-20 ids, e.g. mem-09839b44); the bare 8-hex form is also accepted; bumps usage",
     promptSnippet: "Read full memory entries by id (e.g. mem-09839b44)",
     parameters: Type.Object({
-      ids: Type.Array(Type.String(), { minItems: 1, maxItems: 5 }),
+      ids: Type.Array(Type.String(), { minItems: 1, maxItems: 20 }),
     }),
     async execute(_id, params) {
       if (!store) throw new Error("memory store not initialized");
@@ -237,15 +248,62 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "memory_forget",
     label: "Memory Forget",
-    description: "Archive a wrong or obsolete memory by id (e.g. mem-09839b44)",
+    description: "Archive a wrong or obsolete memory by id (e.g. mem-09839b44); requires a reason and records an optional forward link",
     promptSnippet: "Archive a memory by id (e.g. mem-09839b44)",
-    parameters: Type.Object({ id: Type.String() }),
+    parameters: Type.Object({
+      id: Type.String(),
+      reason: Type.String({
+        description: "Why this memory is being archived (required): the only signal that explains a disappearance",
+      }),
+      supersededBy: Type.Optional(
+        Type.String({ description: "Id of the memory that replaces this one; recorded on the archive" }),
+      ),
+    }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
       if (!store) throw new Error("memory store not initialized");
       if (writesDisabled) throw new Error("pi-memory writes disabled after storage error");
       const res = (await guard(() => handleMemoryForget(store!, params), ctx)) as ReturnType<typeof handleMemoryForget>;
       await updateWidget(ctx);
       return res;
+    },
+  });
+
+  pi.registerTool({
+    name: "memory_verify",
+    label: "Memory Verify",
+    description:
+      "Mark a memory as re-checked against the repo (stamps verifiedAt, optionally records an anchor); verified entries rank above merely-cited ones",
+    promptSnippet: "Re-verify a memory against the repo after checking its claim",
+    parameters: Type.Object({
+      id: Type.String({ description: "Memory id, e.g. mem-09839b44" }),
+      anchor: Type.Optional(Type.String({ description: "Evidence the re-check used: commit sha or file:line" })),
+    }),
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      if (!store) throw new Error("memory store not initialized");
+      if (writesDisabled) throw new Error("pi-memory writes disabled after storage error");
+      const res = (await guard(() => handleMemoryVerify(store!, params), ctx)) as ReturnType<typeof handleMemoryVerify>;
+      await updateWidget(ctx);
+      return res;
+    },
+  });
+
+  pi.registerTool({
+    name: "memory_list",
+    label: "Memory List",
+    description:
+      "Paged enumeration of stored memories (id, type, title, strength, status, anchor, verifiedAt) for auditing without reading files off disk",
+    promptSnippet: "List/paginate stored memories (id, type, title, strength, status)",
+    parameters: Type.Object({
+      scope: Type.Optional(StringEnum(["project", "global", "all"] as const)),
+      type: Type.Optional(StringEnum(["decision", "fact", "lesson", "snapshot"] as const)),
+      status: Type.Optional(StringEnum(["active", "superseded", "expired", "all"] as const)),
+      limit: Type.Optional(Type.Number()),
+      offset: Type.Optional(Type.Number()),
+      includeArchive: Type.Optional(Type.Boolean()),
+    }),
+    async execute(_id, params) {
+      if (!store) throw new Error("memory store not initialized");
+      return handleMemoryList(store, params);
     },
   });
 

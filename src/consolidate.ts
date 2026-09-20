@@ -19,7 +19,7 @@ function isValidOp(x: unknown): x is MemoryOp {
   switch (o.op) {
     case "ADD":
       return (
-        (o.type === "decision" || o.type === "fact" || o.type === "lesson") &&
+        (o.type === "decision" || o.type === "fact" || o.type === "lesson" || o.type === "snapshot") &&
         typeof o.title === "string" &&
         typeof o.body === "string" &&
         (o.scope === "project" || o.scope === "global") &&
@@ -155,6 +155,14 @@ export async function applyOps(
   for (const op of ops.slice(0, cfg.maxOpsPerRun)) {
     if (op.op === "NOOP") continue;
     if (op.op === "ADD") {
+      if (op.type === "snapshot") {
+        // The consolidation op schema carries no anchor/expiresAfter, so a snapshot
+        // ADD could never satisfy the P2-7 requirement — refuse it here rather than
+        // create a snapshot that never expires.
+        result.skipped += 1;
+        result.notes.push(`ADD "${op.title}" skipped: snapshot requires anchor+expiresAfter (use memory_save)`);
+        continue;
+      }
       if (op.confidence < 0.7) {
         result.skipped += 1;
         result.notes.push(`ADD "${op.title}" skipped: confidence ${op.confidence} < 0.7`);
@@ -259,8 +267,8 @@ export async function runConsolidation(
 
   if (text.length > 0) {
     const indexLines = [
-      ...(await store.indexLines("project")),
-      ...(await store.indexLines("global")),
+      ...(await store.activeIndexLines("project")),
+      ...(await store.activeIndexLines("global")),
     ];
     let raw: string;
     try {
