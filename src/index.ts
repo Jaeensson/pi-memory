@@ -188,7 +188,7 @@ export default function (pi: ExtensionAPI) {
     promptSnippet: "Save a durable decision/fact/lesson to long-term memory",
     promptGuidelines: [
       "Use memory_save to persist durable project decisions, facts, and lessons from mistakes. Call it immediately when the user corrects your approach — corrections must not wait for later.",
-      "When the new memory replaces an existing one, pass its id in supersedes so the old entry is retired (kept on disk for audit) instead of competing for injection. If the result reports overlapping ids, resave with supersedes or rephrase.",
+      "When the new memory replaces an existing one, pass its id in supersedes so the old entry is retired (kept on disk for audit) instead of competing for injection — supersede only the memories it actually replaces, never the whole related list. 'Related' ids in the save result are advisory, not blockers; if one is now stale, retire it afterwards with memory_forget (id, supersededBy).",
     ],
     parameters: Type.Object({
       type: StringEnum(["decision", "fact", "lesson", "snapshot"] as const),

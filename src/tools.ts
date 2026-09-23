@@ -60,9 +60,11 @@ export async function dedupCheck(
 // ---------- handlers ----------
 
 const SNAPSHOT_ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{3})?Z$/;
-// A score at or above this is a near-copy worth blocking on; below it we still
-// report overlaps but let the save through (they may be legitimately related).
-const OVERLAP_STRONG = 6;
+// Lexical overlap is topical similarity, not duplication: two shared title
+// stems already clear any plausible threshold, so blocking on it caused
+// unwinnable retry loops (every rephrase matched a different set). Only the
+// true near-copy dedupCheck above blocks; the scored overlaps below are an
+// advisory on the success path.
 const OVERLAP_MIN = 3;
 
 const rejectedSave = (reason: string, details: Record<string, unknown> = {}): ToolResult => ({
@@ -132,21 +134,6 @@ export async function handleMemorySave(
     .sort((a, b) => b.score - a.score || a.file.id.localeCompare(b.file.id))
     .slice(0, 3)
     .map((o) => ({ id: o.file.id, title: o.file.title, score: o.score }));
-  const strong = overlaps.filter((o) => o.score >= OVERLAP_STRONG && !supersedes.includes(o.id));
-  if (strong.length > 0) {
-    const list = strong.map((o) => `- [${o.id}] ${o.title}`).join("\n");
-    return {
-      content: [{
-        type: "text",
-        text:
-          `Not saved: ${strong.length > 1 ? "overlapping memories exist" : "an overlapping memory exists"}:\n${list}\n` +
-          `If this replaces ${strong.length > 1 ? "them" : "it"}, resave with supersedes: [${strong
-            .map((o) => `"${o.id}"`)
-            .join(", ")}]; otherwise rephrase so the two are distinguishable.`,
-      }],
-      details: { saved: false, duplicate: false, overlaps: strong },
-    };
-  }
 
   const file = await store.save({ ...params, supersedes });
   const superseded: string[] = [];
@@ -168,9 +155,13 @@ export async function handleMemorySave(
   if (supersedesNotFound.length > 0) details.supersedesNotFound = supersedesNotFound;
   if (overlaps.length > 0) details.overlaps = overlaps;
   // details are UI-only; the model only sees content, so surface weak overlaps here too.
+  // The advice is deliberately selective: superseding/archiving everything listed
+  // would retire still-valid memories just to complete a save.
   const advisory =
     overlaps.length > 0
-      ? `\nRelated: ${overlaps.map((o) => `[${o.id}] ${o.title}`).join("; ")}. If this supersedes one, resave with supersedes.`
+      ? `\nRelated (advisory, not duplicates): ${overlaps.map((o) => `[${o.id}] ${o.title}`).join("; ")}. ` +
+        `If this memory fully replaces one of them, archive it afterwards with memory_forget (id, supersededBy: "${file.id}") — ` +
+        `only the ones it actually replaces.`
       : "";
   return {
     content: [{ type: "text", text: `Saved ${file.scope} memory ${file.id}: ${file.title}${advisory}` }],

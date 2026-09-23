@@ -139,7 +139,7 @@ describe("P0-1 supersession", () => {
 });
 
 describe("P0-2 save-time overlap detection", () => {
-  it("returns overlapping ids instead of silently appending a near-copy", async () => {
+  it("saves a heavily-overlapping memory and reports the related id as advisory", async () => {
     const first = await handleMemorySave(store, {
       type: "decision",
       title: "UI personality butler persona light app dark accents",
@@ -150,10 +150,42 @@ describe("P0-2 save-time overlap detection", () => {
       title: "UI personality butler persona light app dark accents design",
       body: "design language refined",
     });
-    expect(second.details.saved).toBe(false);
+    expect(second.details.saved).toBe(true);
     const overlaps = second.details.overlaps as { id: string }[];
     expect(overlaps.some((o) => o.id === first.details.id)).toBe(true);
-    expect(second.content[0].text).toMatch(/supersede/i);
+    expect(second.content[0].text).toMatch(/related/i);
+    // The advisory must steer to selective retirement, not blanket supersedes
+    // and not another resave (which would duplicate the new memory).
+    expect(second.content[0].text).toMatch(/memory_forget/);
+    expect(second.content[0].text).toMatch(/supersededBy/);
+  });
+
+  it("never blocks a save that only shares domain vocabulary with unrelated memories", async () => {
+    // Regression for the observed retry loop: same-domain memories make nearly
+    // every new save score above the old block threshold, and each rephrase
+    // matched a different set. All of these must save on the first attempt.
+    await handleMemorySave(store, {
+      type: "lesson",
+      title: "amd64 is not a priority; amd64-only build/test targets",
+      body: "arm64 is not a priority for image builds",
+    });
+    await handleMemorySave(store, {
+      type: "lesson",
+      title: "Image strategy: community images as base plus an image contract",
+      body: "no fully custom Dockerfiles",
+    });
+    await handleMemorySave(store, {
+      type: "lesson",
+      title: "Valheim image published and pre-pulled on node, awaiting server recreation",
+      body: "image pull happens during provision",
+    });
+    const res = await handleMemorySave(store, {
+      type: "lesson",
+      title: "Mac arm64 cannot run the amd64 game server image locally",
+      body: "CI smoke tests pass on amd64; only this arm64 Mac fails, so test image changes in CI.",
+    });
+    expect(res.details.saved).toBe(true);
+    expect(res.content[0].text).not.toMatch(/not saved/i);
   });
 
   it("still saves genuinely distinct memories", async () => {
