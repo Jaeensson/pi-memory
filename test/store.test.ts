@@ -76,7 +76,20 @@ describe("MarkdownStore", () => {
     expect(files.map((f) => f.title)).toEqual(["high", "low"]);
   });
 
-  it("list skips corrupt files and counts them in corruptCount", async () => {
+  it("list ignores noncanonical conflict-copy filenames without counting them as corrupt", async () => {
+    const { readFile, writeFile } = await import("node:fs/promises");
+    const saved = await store.save(mem({ title: "valid" }));
+    const dir = store.scopeDir("project");
+    const canonical = await readFile(join(dir, `${saved.id}.md`), "utf8");
+    await writeFile(join(dir, `${saved.id}-omen-safeBackup-0001.md`), canonical, "utf8");
+    await writeFile(join(dir, "INDEX-omen-safeBackup-0001.md"), "stale generated index", "utf8");
+
+    const files = await store.list("project");
+    expect(files.map((f) => f.title)).toEqual(["valid"]);
+    expect(store.corruptCount).toBe(0);
+  });
+
+  it("list skips corrupt canonical memory files and counts them in corruptCount", async () => {
     const { writeFile } = await import("node:fs/promises");
     await store.save(mem({ title: "valid" }));
     await writeFile(

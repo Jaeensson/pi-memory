@@ -425,13 +425,15 @@ export class MarkdownStore {
     }
     const files: MemoryFile[] = [];
     for (const name of names) {
-      if (!name.endsWith(".md")) continue;
+      // Only canonical memory filenames are records. Ignore generated indexes,
+      // OneDrive conflict copies, and other sidecar markdown artifacts.
+      if (!/^mem-[0-9a-f]{8}\.md$/.test(name)) continue;
       try {
         const raw = await readFile(join(dir, name), "utf8");
         const parsed = parseMemoryFile(raw, scope);
         if (parsed) files.push(parsed);
-        else if (name !== "INDEX.md") {
-          // generated index is not a memory file; count each bad path once, not per read
+        else {
+          // Count each malformed canonical memory path once, not per read.
           const key = join(dir, name);
           if (!this.corruptSeen.has(key)) {
             this.corruptSeen.add(key);
