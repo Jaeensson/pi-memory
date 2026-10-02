@@ -19,17 +19,19 @@ export async function applyDecayAndPrune(
   cfg: { halfLifeDays: number; pruneDays: number; pruneStrength: number },
   now: Date,
 ): Promise<{ pruned: string[] }> {
-  const pruned: string[] = [];
-  for (const file of await store.all()) {
-    file.strength = computeStrength(file.useCount, file.lastUsed, now, cfg);
-    const ageDays = (now.getTime() - Date.parse(file.lastUsed)) / 86400000;
-    if (!file.pinned && ageDays > cfg.pruneDays && file.strength < cfg.pruneStrength) {
-      if (await store.moveToArchive(file.id, "decayed: unused and weak")) {
-        pruned.push(file.id);
-        continue;
+  return store.withMutation(async () => {
+    const pruned: string[] = [];
+    for (const file of await store.all()) {
+      file.strength = computeStrength(file.useCount, file.lastUsed, now, cfg);
+      const ageDays = (now.getTime() - Date.parse(file.lastUsed)) / 86400000;
+      if (!file.pinned && ageDays > cfg.pruneDays && file.strength < cfg.pruneStrength) {
+        if (await store.moveToArchive(file.id, "decayed: unused and weak")) {
+          pruned.push(file.id);
+          continue;
+        }
       }
+      await store.update(file);
     }
-    await store.update(file);
-  }
-  return { pruned };
+    return { pruned };
+  });
 }

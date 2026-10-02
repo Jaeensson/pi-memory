@@ -1,12 +1,15 @@
 import { createHash, randomBytes } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
 import {
   mkdir,
   readdir,
   readFile,
+  realpath,
   rename,
   writeFile,
 } from "node:fs/promises";
-import { join } from "node:path";
+import { resolve, join } from "node:path";
+import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 
 // File format, slug logic, and the MarkdownStore persistence layer.
 
@@ -286,6 +289,8 @@ function writeAtomic(path: string, data: string): Promise<void> {
   return writeFile(tmp, data, "utf8").then(() => rename(tmp, path));
 }
 
+const mutationContext = new AsyncLocalStorage<Set<string>>();
+
 export class MarkdownStore {
   readonly root: string;
   readonly projectSlug: string;
@@ -307,6 +312,45 @@ export class MarkdownStore {
     this.root = root;
     this.projectSlug = projectSlug;
     this.limits = limits ?? DEFAULT_LIMITS;
+  }
+
+  /**
+   * Serialize mutations against the canonical root; nested calls reuse the lock.
+   * Cancellation skips queued work, but never detaches a mutation already writing.
+   */
+  async withMutation<T>(fn: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+    signal?.throwIfAborted();
+    let canonicalRoot: string;
+    try {
+      canonicalRoot = await realpath(this.root);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== "ENOENT" && code !== "ENOTDIR") throw error;
+      canonicalRoot = resolve(this.root);
+    }
+    signal?.throwIfAborted();
+    const active = mutationContext.getStore();
+    if (active?.has(canonicalRoot)) return fn();
+    let started = false;
+    const operation = withFileMutationQueue(canonicalRoot, async () => {
+      signal?.throwIfAborted();
+      started = true;
+      const nested = new Set(active ?? []);
+      nested.add(canonicalRoot);
+      return mutationContext.run(nested, fn);
+    });
+    if (!signal) return operation;
+    return new Promise<T>((resolveOperation, rejectOperation) => {
+      const onAbort = () => {
+        if (!started) {
+          signal.removeEventListener("abort", onAbort);
+          rejectOperation(signal.reason);
+        }
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+      if (signal.aborted) onAbort();
+      operation.then(resolveOperation, rejectOperation).finally(() => signal.removeEventListener("abort", onAbort));
+    });
   }
 
   scopeDir(scope: MemoryScope): string {
@@ -359,30 +403,32 @@ export class MarkdownStore {
     anchor?: string;
     expiresAfter?: string;
   }): Promise<MemoryFile> {
-    const scope = input.scope ?? "project";
-    const now = new Date().toISOString();
-    const file: MemoryFile = {
-      id: await this.nextId(),
-      type: input.type,
-      title: input.title,
-      created: now,
-      lastUsed: now,
-      useCount: 0,
-      strength: 0.5,
-      scope,
-      pinned: input.pinned === true,
-      revision: 0,
-      previousTitles: [],
-      ...(input.supersedes !== undefined && input.supersedes.length > 0
-        ? { supersedes: [...input.supersedes] }
-        : {}),
-      ...(input.anchor !== undefined ? { anchor: input.anchor } : {}),
-      ...(input.expiresAfter !== undefined ? { expiresAfter: input.expiresAfter } : {}),
-      body: input.body,
-    };
-    await writeAtomic(join(this.scopeDir(scope), this.fileTitle(file.id)), serializeMemoryFile(file));
-    await this.regenerateIndex(scope);
-    return file;
+    return this.withMutation(async () => {
+      const scope = input.scope ?? "project";
+      const now = new Date().toISOString();
+      const file: MemoryFile = {
+        id: await this.nextId(),
+        type: input.type,
+        title: input.title,
+        created: now,
+        lastUsed: now,
+        useCount: 0,
+        strength: 0.5,
+        scope,
+        pinned: input.pinned === true,
+        revision: 0,
+        previousTitles: [],
+        ...(input.supersedes !== undefined && input.supersedes.length > 0
+          ? { supersedes: [...input.supersedes] }
+          : {}),
+        ...(input.anchor !== undefined ? { anchor: input.anchor } : {}),
+        ...(input.expiresAfter !== undefined ? { expiresAfter: input.expiresAfter } : {}),
+        body: input.body,
+      };
+      await writeAtomic(join(this.scopeDir(scope), this.fileTitle(file.id)), serializeMemoryFile(file));
+      await this.regenerateIndex(scope);
+      return file;
+    });
   }
 
   async get(id: string): Promise<MemoryFile | undefined> {
@@ -400,8 +446,10 @@ export class MarkdownStore {
   }
 
   async update(file: MemoryFile): Promise<void> {
-    await writeAtomic(join(this.scopeDir(file.scope), this.fileTitle(file.id)), serializeMemoryFile(file));
-    await this.regenerateIndex(file.scope);
+    return this.withMutation(async () => {
+      await writeAtomic(join(this.scopeDir(file.scope), this.fileTitle(file.id)), serializeMemoryFile(file));
+      await this.regenerateIndex(file.scope);
+    });
   }
 
   async list(scope: MemoryScope, opts?: { includeArchive?: boolean }): Promise<MemoryFile[]> {
@@ -466,39 +514,42 @@ export class MarkdownStore {
   }
 
   async moveToArchive(id: string, reason?: string): Promise<boolean> {
-    const canonical = normalizeMemoryId(id);
-    if (!canonical) return false;
-    for (const scope of ["project", "global"] as const) {
-      const src = join(this.scopeDir(scope), this.fileTitle(canonical));
-      let raw: string;
-      try {
-        raw = await readFile(src, "utf8");
-      } catch {
-        continue;
+    return this.withMutation(async () => {
+      const canonical = normalizeMemoryId(id);
+      if (!canonical) return false;
+      for (const scope of ["project", "global"] as const) {
+        const src = join(this.scopeDir(scope), this.fileTitle(canonical));
+        try {
+          await readFile(src, "utf8");
+        } catch {
+          continue;
+        }
+        const dst = join(this.archiveDir(scope), this.fileTitle(canonical));
+        await rename(src, dst);
+        if (reason !== undefined) {
+          const hash = createHash("sha256").update(reason + canonical).digest("hex").slice(0, 8);
+          await writeFile(join(this.archiveDir(scope), `.reason-${hash}`), reason, "utf8");
+        }
+        await this.regenerateIndex(scope);
+        return true;
       }
-      const dst = join(this.archiveDir(scope), this.fileTitle(canonical));
-      await rename(src, dst);
-      if (reason !== undefined) {
-        const hash = createHash("sha256").update(reason + canonical).digest("hex").slice(0, 8);
-        await writeFile(join(this.archiveDir(scope), `.reason-${hash}`), reason, "utf8");
-      }
-      await this.regenerateIndex(scope);
-      return true;
-    }
-    return false;
+      return false;
+    });
   }
 
   async bumpUsage(ids: string[], now: Date = new Date()): Promise<number> {
-    let count = 0;
-    for (const id of ids) {
-      const file = await this.get(id);
-      if (!file) continue;
-      file.useCount += 1;
-      file.lastUsed = now.toISOString();
-      await this.update(file);
-      count += 1;
-    }
-    return count;
+    return this.withMutation(async () => {
+      let count = 0;
+      for (const id of ids) {
+        const file = await this.get(id);
+        if (!file) continue;
+        file.useCount += 1;
+        file.lastUsed = now.toISOString();
+        await this.update(file);
+        count += 1;
+      }
+      return count;
+    });
   }
 
   async regenerateIndex(scope: MemoryScope): Promise<void> {

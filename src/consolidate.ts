@@ -23,12 +23,14 @@ function isValidOp(x: unknown): x is MemoryOp {
         typeof o.title === "string" &&
         typeof o.body === "string" &&
         (o.scope === "project" || o.scope === "global") &&
-        typeof o.confidence === "number"
+        typeof o.confidence === "number" && Number.isFinite(o.confidence) && o.confidence >= 0 && o.confidence <= 1
       );
     case "UPDATE":
-      return typeof o.targetId === "string" && typeof o.body === "string";
+      return typeof o.targetId === "string" && typeof o.body === "string" &&
+        (o.title === undefined || typeof o.title === "string") &&
+        (o.reason === undefined || typeof o.reason === "string");
     case "DELETE":
-      return typeof o.targetId === "string";
+      return typeof o.targetId === "string" && (o.reason === undefined || typeof o.reason === "string");
     case "NOOP":
       return true;
     default:
@@ -36,18 +38,21 @@ function isValidOp(x: unknown): x is MemoryOp {
   }
 }
 
-export function parseOps(raw: string, maxOps: number): MemoryOp[] {
+function parseExtraction(raw: string): unknown[] | null {
   const start = raw.indexOf("[");
   const end = raw.lastIndexOf("]");
-  if (start === -1 || end <= start) return [];
+  if (start === -1 || end <= start) return null;
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw.slice(start, end + 1));
   } catch {
-    return [];
+    return null;
   }
-  if (!Array.isArray(parsed)) return [];
-  return parsed.filter(isValidOp).slice(0, maxOps);
+  return Array.isArray(parsed) ? parsed : null;
+}
+
+export function parseOps(raw: string, maxOps: number): MemoryOp[] {
+  return (parseExtraction(raw) ?? []).filter(isValidOp).slice(0, maxOps);
 }
 
 // ---------- transcript ----------
@@ -146,6 +151,15 @@ export interface AppliedOps {
 }
 
 export async function applyOps(
+  store: MarkdownStore,
+  ops: MemoryOp[],
+  cfg: { maxOpsPerRun: number },
+  now: Date,
+): Promise<AppliedOps> {
+  return store.withMutation(() => applyOpsUnlocked(store, ops, cfg, now));
+}
+
+async function applyOpsUnlocked(
   store: MarkdownStore,
   ops: MemoryOp[],
   cfg: { maxOpsPerRun: number },
@@ -258,8 +272,9 @@ const TRANSCRIPT_MAX_CHARS = 30000;
 export async function runConsolidation(
   store: MarkdownStore,
   entries: SessionEntryLike[],
-  opts: { complete: CompleteFn; cfg: MemoryConfig; sessionId: string | null; now: Date },
+  opts: { complete: CompleteFn; cfg: MemoryConfig; sessionId: string | null; now: Date; signal?: AbortSignal },
 ): Promise<ConsolidationResult> {
+  if (opts.signal?.aborted) return { ok: false, reason: "memory consolidation aborted" };
   const wm = new WatermarkStore(store.scopeDir("project"));
   const state = await wm.read();
 
@@ -272,31 +287,38 @@ export async function runConsolidation(
     ];
     let raw: string;
     try {
+      opts.signal?.throwIfAborted();
       raw = await opts.complete(buildExtractionPrompt(indexLines, text));
+      opts.signal?.throwIfAborted();
     } catch (err) {
       return { ok: false, reason: err instanceof Error ? err.message : String(err) };
     }
-    const ops = parseOps(raw, opts.cfg.maxOpsPerRun);
-    const applied = await applyOps(store, ops, { maxOpsPerRun: opts.cfg.maxOpsPerRun }, opts.now);
-    if (lastId !== null) {
-      await wm.write({
-        sessionId: opts.sessionId,
-        lastEntryId: lastId,
-        lastConsolidatedAt: opts.now.toISOString(),
-      });
+    const extracted = parseExtraction(raw);
+    if (extracted === null || !extracted.every(isValidOp)) {
+      return { ok: false, reason: "invalid memory extraction: expected an array of valid operations" };
     }
-    const { pruned } = await applyDecayAndPrune(store, opts.cfg, opts.now);
-    return { ok: true, applied, pruned };
+    const ops = extracted.slice(0, opts.cfg.maxOpsPerRun);
+    return store.withMutation(async () => {
+      opts.signal?.throwIfAborted();
+      // Once file mutation starts, finish the commit including its watermark.
+      // Shutdown awaits this phase rather than leaving partially applied state.
+      const applied = await applyOps(store, ops, { maxOpsPerRun: opts.cfg.maxOpsPerRun }, opts.now);
+      const { pruned } = await applyDecayAndPrune(store, opts.cfg, opts.now);
+      if (lastId !== null) {
+        await wm.write({
+          sessionId: opts.sessionId,
+          lastEntryId: lastId,
+          lastConsolidatedAt: opts.now.toISOString(),
+        });
+      }
+      return { ok: true, applied, pruned };
+    }, opts.signal);
   }
 
   // Nothing new: still run decay/prune, skip the LLM.
-  const { pruned } = await applyDecayAndPrune(store, opts.cfg, opts.now);
-  if (lastId !== null) {
-    await wm.write({
-      sessionId: opts.sessionId,
-      lastEntryId: lastId,
-      lastConsolidatedAt: opts.now.toISOString(),
-    });
-  }
-  return { ok: true, applied: { added: [], updated: [], deleted: [], skipped: 0, notes: [] }, pruned };
+  return store.withMutation(async () => {
+    opts.signal?.throwIfAborted();
+    const { pruned } = await applyDecayAndPrune(store, opts.cfg, opts.now);
+    return { ok: true, applied: { added: [], updated: [], deleted: [], skipped: 0, notes: [] }, pruned };
+  }, opts.signal);
 }

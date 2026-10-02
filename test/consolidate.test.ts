@@ -13,6 +13,7 @@ import {
   type SessionEntryLike,
 } from "../src/consolidate.js";
 import { MarkdownStore } from "../src/store.js";
+import { handleMemorySave } from "../src/tools.js";
 
 const NOW = new Date("2026-09-08T12:00:00.000Z");
 
@@ -153,6 +154,18 @@ describe("applyOps", () => {
   });
 });
 
+it("serializes extraction deduplication with explicit saves", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pimem-"));
+  const store = new MarkdownStore(root, "testproj");
+  await store.init();
+  const memory = { type: "decision" as const, title: "Concurrent cache decision", body: "Use an embedded cache to avoid an external daemon.", scope: "project" as const };
+  await Promise.all([
+    applyOps(store, [{ op: "ADD", ...memory, confidence: 0.9 }], DEFAULT_CONFIG, NOW),
+    handleMemorySave(store, memory),
+  ]);
+  expect((await store.all()).filter((file) => file.title === memory.title)).toHaveLength(1);
+});
+
 describe("runConsolidation", () => {
   let root: string;
   let store: MarkdownStore;
@@ -213,6 +226,90 @@ describe("runConsolidation", () => {
     expect(res.reason).toMatch(/api down/);
     const wm = await new WatermarkStore(store.scopeDir("project")).read();
     expect(wm.lastEntryId).toBeNull(); // watermark untouched on failure
+  });
+
+  it.each(["", "not JSON", "[", '[{"op":"UNKNOWN"}]', '[{"op":"UPDATE","targetId":"mem-a1b2c3d4","body":"b","title":123}]', '[{"op":"ADD","type":"fact","title":"x","body":"b","scope":"project","confidence":2}]'])("preserves the watermark on invalid extraction: %s", async (raw) => {
+    const res = await runConsolidation(store, entries, { complete: async () => raw, cfg: DEFAULT_CONFIG, sessionId: "s1", now: NOW });
+    expect(res.ok).toBe(false);
+    expect((await new WatermarkStore(store.scopeDir("project")).read()).lastEntryId).toBeNull();
+    expect(await store.all()).toEqual([]);
+  });
+
+  it("cancels a queued commit without waiting for another mutation to finish", async () => {
+    let release!: () => void;
+    let entered!: () => void;
+    const blocker = new Promise<void>((resolve) => { release = resolve; });
+    const ready = new Promise<void>((resolve) => { entered = resolve; });
+    const holding = store.withMutation(async () => { entered(); await blocker; });
+    await ready;
+    const controller = new AbortController();
+    let subscribed!: () => void;
+    const listening = new Promise<void>((resolve) => { subscribed = resolve; });
+    const addListener = controller.signal.addEventListener.bind(controller.signal);
+    controller.signal.addEventListener = (...args: Parameters<AbortSignal["addEventListener"]>) => {
+      addListener(...args);
+      subscribed();
+    };
+    const pending = runConsolidation(store, entries, {
+      complete: async () => JSON.stringify([{ op: "ADD", type: "fact", title: "Cancelled queued fact", body: "Never committed.", scope: "project", confidence: 0.9 }]),
+      cfg: DEFAULT_CONFIG, sessionId: "s1", now: NOW, signal: controller.signal,
+    });
+    const outcome = pending.then(() => "resolved", () => "cancelled");
+    await listening;
+    controller.abort(new Error("cancelled"));
+    const beforeRelease = await Promise.race([outcome, new Promise<string>((resolve) => setTimeout(() => resolve("still queued"), 50))]);
+    release();
+    await holding;
+    await outcome;
+    expect(beforeRelease).toBe("cancelled");
+    expect(await store.all()).toEqual([]);
+    expect((await new WatermarkStore(store.scopeDir("project")).read()).lastEntryId).toBeNull();
+  });
+
+  it.each(["apply", "prune"])("finishes an already started commit when cancelled during %s", async (phase) => {
+    const controller = new AbortController();
+    if (phase === "apply") {
+      const save = store.save.bind(store);
+      store.save = async (input) => {
+        const file = await save(input);
+        controller.abort(new Error("shutdown grace expired"));
+        return file;
+      };
+    } else {
+      const update = store.update.bind(store);
+      store.update = async (file) => {
+        await update(file);
+        controller.abort(new Error("shutdown grace expired"));
+      };
+    }
+    const res = await runConsolidation(store, entries, {
+      complete: async () => JSON.stringify([{ op: "ADD", type: "fact", title: "Completed commit", body: "Files and watermark remain consistent.", scope: "project", confidence: 0.9 }]),
+      cfg: DEFAULT_CONFIG, sessionId: "s1", now: NOW, signal: controller.signal,
+    });
+    expect(controller.signal.aborted).toBe(true);
+    expect(res.ok).toBe(true);
+    expect((await store.all()).map((file) => file.title)).toEqual(["Completed commit"]);
+    expect((await new WatermarkStore(store.scopeDir("project")).read()).lastEntryId).toBe("e2");
+  });
+
+  it("does not apply a response delivered after cancellation", async () => {
+    const controller = new AbortController();
+    const res = await runConsolidation(store, entries, {
+      complete: async () => {
+        controller.abort();
+        return JSON.stringify([{ op: "ADD", type: "fact", title: "Late fact", body: "Too late.", scope: "project", confidence: 0.9 }]);
+      },
+      cfg: DEFAULT_CONFIG, sessionId: "s1", now: NOW, signal: controller.signal,
+    } as Parameters<typeof runConsolidation>[2]);
+    expect(res.ok).toBe(false);
+    expect(await store.all()).toEqual([]);
+    expect((await new WatermarkStore(store.scopeDir("project")).read()).lastEntryId).toBeNull();
+  });
+
+  it("accepts a valid empty extraction and advances its watermark", async () => {
+    const res = await runConsolidation(store, entries, { complete: async () => "[]", cfg: DEFAULT_CONFIG, sessionId: "s1", now: NOW });
+    expect(res.ok).toBe(true);
+    expect((await new WatermarkStore(store.scopeDir("project")).read()).lastEntryId).toBe("e2");
   });
 
   it("buildExtractionPrompt includes index and rules", () => {

@@ -21,6 +21,7 @@ export function registerMemoryCommands(pi: ExtensionAPI, deps: CommandDeps): voi
   pi.registerCommand("memory", {
     description: "Browse, edit, pin, or forget saved memories",
     handler: async (_args: string, ctx: ExtensionContext) => {
+      if (!ctx.hasUI) throw new Error("/memory requires dialog-capable UI (interactive or RPC mode)");
       const store = await deps.getStore();
       if (!store) {
         ctx.ui.notify("Memory store not initialized", "warning");
@@ -48,18 +49,32 @@ export function registerMemoryCommands(pi: ExtensionAPI, deps: CommandDeps): voi
       if (action === "View / edit body") {
         const edited = await ctx.ui.editor(`Edit ${file.id}`, file.body);
         if (edited !== undefined && edited !== file.body) {
-          file.body = edited;
-          await store.update(file);
-          ctx.ui.notify(`Updated ${file.id}`, "info");
+          await store.withMutation(async () => {
+            const current = await store.get(file.id);
+            if (!current) {
+              ctx.ui.notify(`Memory ${file.id} is no longer available`, "warning");
+              return;
+            }
+            current.body = edited;
+            await store.update(current);
+            ctx.ui.notify(`Updated ${file.id}`, "info");
+          });
         }
       } else if (action === "Pin (always inject)" || action === "Unpin") {
-        file.pinned = !file.pinned;
-        await store.update(file);
-        ctx.ui.notify(`${file.pinned ? "Pinned" : "Unpinned"} ${file.id}`, "info");
+        await store.withMutation(async () => {
+          const current = await store.get(file.id);
+          if (!current) {
+            ctx.ui.notify(`Memory ${file.id} is no longer available`, "warning");
+            return;
+          }
+          current.pinned = action === "Pin (always inject)";
+          await store.update(current);
+          ctx.ui.notify(`${current.pinned ? "Pinned" : "Unpinned"} ${file.id}`, "info");
+        });
       } else if (action === "Forget (archive)") {
         if (await ctx.ui.confirm("Forget memory?", `${file.title}\n\nIt will be archived, not deleted.`)) {
-          await store.moveToArchive(file.id, "forgotten via /memory");
-          ctx.ui.notify(`Archived ${file.id}`, "info");
+          const archived = await store.moveToArchive(file.id, "forgotten via /memory");
+          ctx.ui.notify(archived ? `Archived ${file.id}` : `Memory ${file.id} is no longer available`, archived ? "info" : "warning");
         }
       }
     },
@@ -68,6 +83,7 @@ export function registerMemoryCommands(pi: ExtensionAPI, deps: CommandDeps): voi
   pi.registerCommand("memory-preview", {
     description: "Show exactly what pi-memory would inject right now",
     handler: async (_args: string, ctx: ExtensionContext) => {
+      if (!ctx.hasUI) throw new Error("/memory-preview requires dialog-capable UI (interactive or RPC mode)");
       const store = await deps.getStore();
       if (!store) {
         ctx.ui.notify("Memory store not initialized", "warning");

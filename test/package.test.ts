@@ -5,7 +5,7 @@ const packageJson = JSON.parse(readFileSync(new URL("../package.json", import.me
 
 describe("extension package metadata", () => {
   it("declares host-provided runtime packages as wildcard peers", () => {
-    for (const dependency of ["@earendil-works/pi-ai", "typebox"]) {
+    for (const dependency of ["@earendil-works/pi-ai", "@earendil-works/pi-coding-agent", "typebox"]) {
       expect(packageJson.peerDependencies?.[dependency]).toBe("*");
       expect(packageJson.dependencies ?? {}).not.toHaveProperty(dependency);
     }

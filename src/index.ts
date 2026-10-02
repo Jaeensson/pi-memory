@@ -1,6 +1,5 @@
-import { homedir } from "node:os";
 import { join } from "node:path";
-import { CONFIG_DIR_NAME, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { loadConfig, type MemoryConfig } from "./config.js";
@@ -22,13 +21,31 @@ import {
 } from "./tools.js";
 import { resolveProjectSlug } from "./store.js";
 
+// Providers may ignore cancellation. Stop awaiting them and detach their late result.
+async function abortable<T>(pending: Promise<T>, signal: AbortSignal): Promise<T> {
+  signal.throwIfAborted();
+  let onAbort!: () => void;
+  const aborted = new Promise<never>((_resolve, reject) => {
+    onAbort = () => reject(signal.reason);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+  try {
+    return await Promise.race([pending, aborted]);
+  } finally {
+    signal.removeEventListener("abort", onAbort);
+  }
+}
+
 export default function (pi: ExtensionAPI) {
-  const memoryRoot = join(homedir(), CONFIG_DIR_NAME, "agent", "memory");
+  // Follow the configured agent directory without replacing existing symlinks.
+  const memoryRoot = join(getAgentDir(), "memory");
 
   let cfg: MemoryConfig | undefined;
   let store: MarkdownStore | undefined;
   let idleTimer: ReturnType<typeof setTimeout> | undefined;
-  let consolidating = false;
+  let consolidationPromise: Promise<void> | undefined;
+  let consolidationController: AbortController | undefined;
+  let shuttingDown = false;
   let writesDisabled = false;
 
   const updateWidget = async (ctx: ExtensionContext) => {
@@ -39,7 +56,7 @@ export default function (pi: ExtensionAPI) {
 
   const resetIdleTimer = (ctx: ExtensionContext) => {
     if (idleTimer) clearTimeout(idleTimer);
-    if (!cfg?.enabled || !store || !ctx.model) return;
+    if (shuttingDown || !cfg?.enabled || !store || !ctx.model) return;
     idleTimer = setTimeout(() => {
       void runConsolidationSafely(ctx).catch(() => {}); // session may have gone stale mid-run
     }, cfg.idleSeconds * 1000);
@@ -58,18 +75,20 @@ export default function (pi: ExtensionAPI) {
       throw err;
     });
 
-  const makeComplete = (ctx: ExtensionContext): CompleteFn => {
+  const makeComplete = (ctx: ExtensionContext, signal: AbortSignal): CompleteFn => {
+    // Capture session-bound model state before any asynchronous work.
+    const registry = ctx.modelRegistry;
+    let model = ctx.model;
+    if (cfg?.consolidationModel) {
+      const [providerId, ...rest] = cfg.consolidationModel.split("/");
+      model = registry.find(providerId, rest.join("/")) ?? model;
+    }
     return async (prompt: string) => {
-      const registry = ctx.modelRegistry;
-      let model = ctx.model;
-      if (cfg?.consolidationModel) {
-        const [providerId, ...rest] = cfg.consolidationModel.split("/");
-        model = registry.find(providerId, rest.join("/")) ?? ctx.model;
-      }
+      signal.throwIfAborted();
       if (!model || !registry.hasConfiguredAuth(model)) {
         throw new Error("no model configured for memory consolidation");
       }
-      const response = await registry.complete(
+      const response = await abortable(registry.streamSimple(
         model,
         {
           messages: [
@@ -80,8 +99,11 @@ export default function (pi: ExtensionAPI) {
             },
           ],
         },
-        { cacheRetention: "none" },
-      );
+        { cacheRetention: "none", signal },
+      ).result(), signal);
+      if (response.stopReason !== "stop") {
+        throw new Error(response.errorMessage ?? `memory consolidation did not finish (${response.stopReason})`);
+      }
       return response.content
         .filter((c): c is { type: "text"; text: string } => c.type === "text")
         .map((c) => c.text)
@@ -89,49 +111,61 @@ export default function (pi: ExtensionAPI) {
     };
   };
 
-  const runConsolidationSafely = async (ctx: ExtensionContext) => {
-    if (!store || !cfg || consolidating || !ctx.model) return;
-    let failed = false;
-    consolidating = true;
-    ctx.ui.setWidget("pi-memory", ["memory: consolidating…"]);
-    try {
-      const entries: SessionEntryLike[] = ctx.sessionManager.getBranch().map((e) => ({
-        id: e.id,
-        type: e.type,
-        message: e.type === "message" ? (e.message as SessionEntryLike["message"]) : undefined,
-      }));
-      const result = await runConsolidation(store, entries, {
-        complete: makeComplete(ctx),
-        cfg,
-        sessionId: ctx.sessionManager.getSessionId() ?? null,
-        now: new Date(),
-      });
-      if (!result.ok) {
+  const runConsolidationSafely = async (ctx: ExtensionContext): Promise<void> => {
+    if (consolidationPromise) return consolidationPromise;
+    if (!store || !cfg || !ctx.model || writesDisabled) return Promise.resolve();
+    const activeStore = store;
+    const activeConfig = cfg;
+    const controller = new AbortController();
+    consolidationController = controller;
+    consolidationPromise = (async () => {
+      let failed = false;
+      try {
+        const complete = makeComplete(ctx, controller.signal);
+        const entries: SessionEntryLike[] = ctx.sessionManager.getBranch().map((e) => ({
+          id: e.id,
+          type: e.type,
+          message: e.type === "message" ? (e.message as SessionEntryLike["message"]) : undefined,
+        }));
+        const sessionId = ctx.sessionManager.getSessionId() ?? null;
+        ctx.ui.setWidget("pi-memory", ["memory: consolidating…"]);
+        const result = await runConsolidation(activeStore, entries, {
+          complete, cfg: activeConfig, sessionId, now: new Date(), signal: controller.signal,
+        });
+        if (controller.signal.aborted) return;
+        if (!result.ok) {
+          failed = true;
+          ctx.ui.setWidget("pi-memory", ["memory: idle (consolidation failed — will retry)"]);
+          ctx.ui.notify(`pi-memory consolidation failed: ${result.reason}`, "warning");
+        } else {
+          const changed = (result.applied?.added.length ?? 0) + (result.applied?.updated.length ?? 0) + (result.applied?.deleted.length ?? 0) + (result.pruned?.length ?? 0);
+          if (changed > 0) ctx.ui.notify(`pi-memory: +${result.applied?.added.length ?? 0} ~${result.applied?.updated.length ?? 0} -${result.applied?.deleted.length ?? 0} pruned ${result.pruned?.length ?? 0}`, "info");
+        }
+      } catch (err) {
         failed = true;
-        ctx.ui.setWidget("pi-memory", ["memory: idle (consolidation failed — will retry)"]);
-        ctx.ui.notify(`pi-memory consolidation failed: ${result.reason}`, "warning");
-      } else {
-        const changed = (result.applied?.added.length ?? 0) + (result.applied?.updated.length ?? 0) + (result.applied?.deleted.length ?? 0) + (result.pruned?.length ?? 0);
-        if (changed > 0) ctx.ui.notify(`pi-memory: +${result.applied?.added.length ?? 0} ~${result.applied?.updated.length ?? 0} -${result.applied?.deleted.length ?? 0} pruned ${result.pruned?.length ?? 0}`, "info");
-      }
-    } catch (err) {
-      failed = true;
-      const msg = err instanceof Error ? err.message : String(err);
-      ctx.ui.setWidget("pi-memory", ["memory: idle (consolidation failed — will retry)"]);
-      ctx.ui.notify(`pi-memory consolidation failed: ${msg}`, "warning");
-    } finally {
-      consolidating = false;
-      if (!failed) {
-        try {
-          await updateWidget(ctx);
-        } catch {
-          // session went stale (e.g. /reload) mid-consolidation — widget update is best-effort
+        if (!controller.signal.aborted) {
+          const msg = err instanceof Error ? err.message : String(err);
+          ctx.ui.setWidget("pi-memory", ["memory: idle (consolidation failed — will retry)"]);
+          ctx.ui.notify(`pi-memory consolidation failed: ${msg}`, "warning");
+        }
+      } finally {
+        if (!failed && !controller.signal.aborted) {
+          try {
+            await updateWidget(ctx);
+          } catch {
+            // Widget updates are best-effort during session teardown.
+          }
         }
       }
-    }
+    })().finally(() => {
+      consolidationPromise = undefined;
+      consolidationController = undefined;
+    });
+    return consolidationPromise;
   };
 
   pi.on("session_start", async (event, ctx) => {
+    shuttingDown = false;
     cfg = await loadConfig(memoryRoot);
     if (!cfg.enabled) return;
     const slug = await resolveProjectSlug(ctx.cwd);
@@ -157,7 +191,7 @@ export default function (pi: ExtensionAPI) {
     if (!store || !cfg?.enabled) return;
     resetIdleTimer(ctx);
     const block = renderMemoryBlock(await gatherInjection(store, cfg), cfg);
-    return { systemPrompt: `${event.systemPrompt}\n\n${block.text}` };
+    event.systemPromptOptions.sections.memory = block.text;
   });
 
   pi.on("agent_start", async (_event, ctx) => {
@@ -169,13 +203,17 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
+    shuttingDown = true;
     if (idleTimer) clearTimeout(idleTimer);
-    // Best-effort final consolidation with a short grace period.
-    if (store && cfg?.enabled && ctx.model) {
-      await Promise.race([
-        runConsolidationSafely(ctx).catch(() => {}),
-        new Promise((resolve) => setTimeout(resolve, 5000)),
-      ]);
+    idleTimer = undefined;
+    // Await the existing run (or one final run), then cancel if its grace expires.
+    const pending = consolidationPromise ?? runConsolidationSafely(ctx);
+    const controller = consolidationController;
+    const grace = setTimeout(() => controller?.abort(new Error("memory consolidation shutdown timeout")), 5000);
+    try {
+      await pending;
+    } finally {
+      clearTimeout(grace);
     }
   });
 

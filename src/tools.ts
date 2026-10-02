@@ -85,88 +85,90 @@ export async function handleMemorySave(
     expiresAfter?: string;
   },
 ): Promise<ToolResult> {
-  const scan = secretScan(`${params.title}\n${params.body}`);
-  if (!scan.ok) return rejectedSave(scan.reason ?? "rejected");
+  return store.withMutation(async () => {
+    const scan = secretScan(`${params.title}\n${params.body}`);
+    if (!scan.ok) return rejectedSave(scan.reason ?? "rejected");
 
-  // A snapshot is time-stamped state, not durable truth: it must say what it is
-  // anchored to and when it stops being current, or it rots into a false fact.
-  if (params.type === "snapshot") {
-    if (params.anchor === undefined || params.anchor.trim() === "") {
-      return rejectedSave("rejected: a snapshot needs an `anchor` (commit sha or file:line)");
+    // A snapshot is time-stamped state, not durable truth: it must say what it is
+    // anchored to and when it stops being current, or it rots into a false fact.
+    if (params.type === "snapshot") {
+      if (params.anchor === undefined || params.anchor.trim() === "") {
+        return rejectedSave("rejected: a snapshot needs an `anchor` (commit sha or file:line)");
+      }
+      if (
+        params.expiresAfter === undefined ||
+        !SNAPSHOT_ISO.test(params.expiresAfter) ||
+        Number.isNaN(Date.parse(params.expiresAfter))
+      ) {
+        return rejectedSave("rejected: a snapshot needs `expiresAfter` as an ISO-8601 UTC timestamp");
+      }
     }
-    if (
-      params.expiresAfter === undefined ||
-      !SNAPSHOT_ISO.test(params.expiresAfter) ||
-      Number.isNaN(Date.parse(params.expiresAfter))
-    ) {
-      return rejectedSave("rejected: a snapshot needs `expiresAfter` as an ISO-8601 UTC timestamp");
+
+    const supersedes = [
+      ...new Set(
+        (params.supersedes ?? [])
+          .map((id) => normalizeMemoryId(id))
+          .filter((id): id is string => id !== null),
+      ),
+    ];
+    const scope = params.scope ?? "project";
+
+    const dup = await dedupCheck(store, params);
+    if (dup && isActive(dup) && !supersedes.includes(dup.id)) {
+      return {
+        content: [{
+          type: "text",
+          text: `Similar memory exists: [${dup.id}] ${dup.title} — resave with supersedes: ["${dup.id}"] to replace it, or rephrase.`,
+        }],
+        details: { saved: false, duplicate: true, id: dup.id },
+      };
     }
-  }
 
-  const supersedes = [
-    ...new Set(
-      (params.supersedes ?? [])
-        .map((id) => normalizeMemoryId(id))
-        .filter((id): id is string => id !== null),
-    ),
-  ];
-  const scope = params.scope ?? "project";
+    // Cheapest fix for the observed near-copies: the same lexical scorer search
+    // uses runs at save time and hands the model the overlapping ids instead of
+    // silently appending a fourth copy of the same decision.
+    const candidates = (await store.all()).filter(
+      (f) => f.scope === scope && f.type === params.type && isActive(f),
+    );
+    const overlaps = scoreFiles(candidates, `${params.title}\n${params.body}`)
+      .filter((o) => o.score >= OVERLAP_MIN)
+      .sort((a, b) => b.score - a.score || a.file.id.localeCompare(b.file.id))
+      .slice(0, 3)
+      .map((o) => ({ id: o.file.id, title: o.file.title, score: o.score }));
 
-  const dup = await dedupCheck(store, params);
-  if (dup && isActive(dup) && !supersedes.includes(dup.id)) {
+    const file = await store.save({ ...params, supersedes });
+    const superseded: string[] = [];
+    const supersedesNotFound: string[] = [];
+    for (const id of supersedes) {
+      const target = await store.get(id);
+      if (!target) {
+        supersedesNotFound.push(id);
+        continue;
+      }
+      if (!isActive(target)) continue;
+      target.status = "superseded";
+      target.supersededBy = file.id;
+      await store.update(target);
+      superseded.push(target.id);
+    }
+    const details: Record<string, unknown> = { saved: true, id: file.id, scope: file.scope };
+    if (superseded.length > 0) details.superseded = superseded;
+    if (supersedesNotFound.length > 0) details.supersedesNotFound = supersedesNotFound;
+    if (overlaps.length > 0) details.overlaps = overlaps;
+    // details are UI-only; the model only sees content, so surface weak overlaps here too.
+    // The advice is deliberately selective: superseding/archiving everything listed
+    // would retire still-valid memories just to complete a save.
+    const advisory =
+      overlaps.length > 0
+        ? `\nRelated (advisory, not duplicates): ${overlaps.map((o) => `[${o.id}] ${o.title}`).join("; ")}. ` +
+          `If this memory fully replaces one of them, archive it afterwards with memory_forget (id, supersededBy: "${file.id}") — ` +
+          `only the ones it actually replaces.`
+        : "";
     return {
-      content: [{
-        type: "text",
-        text: `Similar memory exists: [${dup.id}] ${dup.title} — resave with supersedes: ["${dup.id}"] to replace it, or rephrase.`,
-      }],
-      details: { saved: false, duplicate: true, id: dup.id },
+      content: [{ type: "text", text: `Saved ${file.scope} memory ${file.id}: ${file.title}${advisory}` }],
+      details,
     };
-  }
-
-  // Cheapest fix for the observed near-copies: the same lexical scorer search
-  // uses runs at save time and hands the model the overlapping ids instead of
-  // silently appending a fourth copy of the same decision.
-  const candidates = (await store.all()).filter(
-    (f) => f.scope === scope && f.type === params.type && isActive(f),
-  );
-  const overlaps = scoreFiles(candidates, `${params.title}\n${params.body}`)
-    .filter((o) => o.score >= OVERLAP_MIN)
-    .sort((a, b) => b.score - a.score || a.file.id.localeCompare(b.file.id))
-    .slice(0, 3)
-    .map((o) => ({ id: o.file.id, title: o.file.title, score: o.score }));
-
-  const file = await store.save({ ...params, supersedes });
-  const superseded: string[] = [];
-  const supersedesNotFound: string[] = [];
-  for (const id of supersedes) {
-    const target = await store.get(id);
-    if (!target) {
-      supersedesNotFound.push(id);
-      continue;
-    }
-    if (!isActive(target)) continue;
-    target.status = "superseded";
-    target.supersededBy = file.id;
-    await store.update(target);
-    superseded.push(target.id);
-  }
-  const details: Record<string, unknown> = { saved: true, id: file.id, scope: file.scope };
-  if (superseded.length > 0) details.superseded = superseded;
-  if (supersedesNotFound.length > 0) details.supersedesNotFound = supersedesNotFound;
-  if (overlaps.length > 0) details.overlaps = overlaps;
-  // details are UI-only; the model only sees content, so surface weak overlaps here too.
-  // The advice is deliberately selective: superseding/archiving everything listed
-  // would retire still-valid memories just to complete a save.
-  const advisory =
-    overlaps.length > 0
-      ? `\nRelated (advisory, not duplicates): ${overlaps.map((o) => `[${o.id}] ${o.title}`).join("; ")}. ` +
-        `If this memory fully replaces one of them, archive it afterwards with memory_forget (id, supersededBy: "${file.id}") — ` +
-        `only the ones it actually replaces.`
-      : "";
-  return {
-    content: [{ type: "text", text: `Saved ${file.scope} memory ${file.id}: ${file.title}${advisory}` }],
-    details,
-  };
+  });
 }
 
 const STOPWORDS = new Set([
@@ -335,21 +337,23 @@ export async function handleMemoryForget(
 ): Promise<ToolResult> {
   // The tool schema requires `reason`; this default only covers direct callers
   // (tests, older transcripts) so archiving never loses the field entirely.
-  const reason = params.reason?.trim() ? params.reason.trim() : "forgotten via memory_forget (no reason given)";
-  if (params.supersededBy !== undefined) {
-    const file = await store.get(params.id);
-    if (file) {
-      file.status = "superseded";
-      file.supersededBy = params.supersededBy;
-      await store.update(file);
+  return store.withMutation(async () => {
+    const reason = params.reason?.trim() ? params.reason.trim() : "forgotten via memory_forget (no reason given)";
+    if (params.supersededBy !== undefined) {
+      const file = await store.get(params.id);
+      if (file) {
+        file.status = "superseded";
+        file.supersededBy = params.supersededBy;
+        await store.update(file);
+      }
     }
-  }
-  const note = params.supersededBy !== undefined ? `${reason}\nsupersededBy: ${params.supersededBy}` : reason;
-  const ok = await store.moveToArchive(params.id, note);
-  return {
-    content: [{ type: "text", text: ok ? `Archived ${params.id}: ${reason}` : `${params.id} not found.` }],
-    details: { forgotten: ok, reason, ...(params.supersededBy !== undefined ? { supersededBy: params.supersededBy } : {}) },
-  };
+    const note = params.supersededBy !== undefined ? `${reason}\nsupersededBy: ${params.supersededBy}` : reason;
+    const ok = await store.moveToArchive(params.id, note);
+    return {
+      content: [{ type: "text", text: ok ? `Archived ${params.id}: ${reason}` : `${params.id} not found.` }],
+      details: { forgotten: ok, reason, ...(params.supersededBy !== undefined ? { supersededBy: params.supersededBy } : {}) },
+    };
+  });
 }
 
 /**
@@ -361,18 +365,20 @@ export async function handleMemoryVerify(
   params: { id: string; anchor?: string },
   now: Date = new Date(),
 ): Promise<ToolResult> {
-  const file = await store.get(params.id);
-  if (!file) return text(`${params.id} not found`);
-  file.verifiedAt = now.toISOString();
-  if (params.anchor !== undefined) file.anchor = params.anchor;
-  await store.update(file);
-  return {
-    content: [{
-      type: "text",
-      text: `Verified ${file.id} at ${file.verifiedAt}${file.anchor ? ` (anchor: ${file.anchor})` : ""}.`,
-    }],
-    details: { verified: true, id: file.id, verifiedAt: file.verifiedAt, ...(file.anchor ? { anchor: file.anchor } : {}) },
-  };
+  return store.withMutation(async () => {
+    const file = await store.get(params.id);
+    if (!file) return text(`${params.id} not found`);
+    file.verifiedAt = now.toISOString();
+    if (params.anchor !== undefined) file.anchor = params.anchor;
+    await store.update(file);
+    return {
+      content: [{
+        type: "text",
+        text: `Verified ${file.id} at ${file.verifiedAt}${file.anchor ? ` (anchor: ${file.anchor})` : ""}.`,
+      }],
+      details: { verified: true, id: file.id, verifiedAt: file.verifiedAt, ...(file.anchor ? { anchor: file.anchor } : {}) },
+    };
+  });
 }
 
 /**
