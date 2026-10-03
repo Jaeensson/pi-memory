@@ -154,6 +154,24 @@ describe("consolidation lifecycle", () => {
   });
 });
 
+describe("storage error recovery", () => {
+  it("re-enables writes on the next session after a storage error", async () => {
+    const { chmod } = await import("node:fs/promises");
+    const app = await harness();
+    await app.emit("session_start");
+    const projectDir = join(app.root, "projects", app.store.projectSlug);
+    await chmod(projectDir, 0o555);
+    await expect(app.execute("memory_save", { type: "fact", title: "blocked", body: "b" })).rejects.toMatchObject({
+      code: "EACCES",
+    });
+    expect(app.notifications.some((n) => n.level === "error" && /writes disabled/.test(n.message))).toBe(true);
+    await chmod(projectDir, 0o755);
+    await app.emit("session_start");
+    const saved = await app.execute("memory_save", { type: "fact", title: "allowed", body: "b" });
+    expect((saved.details as { saved?: boolean }).saved).toBe(true);
+  });
+});
+
 describe("command mutations after asynchronous dialogs", () => {
   it.each(["View / edit body", "Pin (always inject)"])("preserves concurrent verification when applying %s", async (action) => {
     const app = await harness();

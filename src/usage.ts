@@ -22,14 +22,19 @@ export async function applyDecayAndPrune(
   return store.withMutation(async () => {
     const pruned: string[] = [];
     for (const file of await store.all()) {
-      file.strength = computeStrength(file.useCount, file.lastUsed, now, cfg);
+      const next = computeStrength(file.useCount, file.lastUsed, now, cfg);
       const ageDays = (now.getTime() - Date.parse(file.lastUsed)) / 86400000;
-      if (!file.pinned && ageDays > cfg.pruneDays && file.strength < cfg.pruneStrength) {
+      if (!file.pinned && ageDays > cfg.pruneDays && next < cfg.pruneStrength) {
         if (await store.moveToArchive(file.id, "decayed: unused and weak")) {
           pruned.push(file.id);
           continue;
         }
       }
+      // Only persist a decay that actually moved the rounded strength. Decay is
+      // continuous, so an unconditional write rewrote every memory (and its index)
+      // on every idle tick — needless churn and sync conflicts on a shared store.
+      if (next === file.strength) continue;
+      file.strength = next;
       await store.update(file);
     }
     return { pruned };

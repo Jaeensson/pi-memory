@@ -228,11 +228,35 @@ describe("runConsolidation", () => {
     expect(wm.lastEntryId).toBeNull(); // watermark untouched on failure
   });
 
-  it.each(["", "not JSON", "[", '[{"op":"UNKNOWN"}]', '[{"op":"UPDATE","targetId":"mem-a1b2c3d4","body":"b","title":123}]', '[{"op":"ADD","type":"fact","title":"x","body":"b","scope":"project","confidence":2}]'])("preserves the watermark on invalid extraction: %s", async (raw) => {
+  it.each(["", "not JSON", "["])("fails when the response has no JSON array: %s", async (raw) => {
     const res = await runConsolidation(store, entries, { complete: async () => raw, cfg: DEFAULT_CONFIG, sessionId: "s1", now: NOW });
     expect(res.ok).toBe(false);
     expect((await new WatermarkStore(store.scopeDir("project")).read()).lastEntryId).toBeNull();
     expect(await store.all()).toEqual([]);
+  });
+
+  it.each([
+    '[{"op":"UNKNOWN"}]',
+    '[{"op":"UPDATE","targetId":"mem-a1b2c3d4","body":"b","title":123}]',
+    '[{"op":"ADD","type":"fact","title":"x","body":"b","scope":"project","confidence":2}]',
+  ])("drops invalid ops, keeps the batch, and advances the watermark: %s", async (raw) => {
+    const res = await runConsolidation(store, entries, { complete: async () => raw, cfg: DEFAULT_CONFIG, sessionId: "s1", now: NOW });
+    expect(res.ok).toBe(true);
+    expect(res.applied?.added).toEqual([]);
+    expect(res.applied?.notes.join(" ")).toMatch(/dropped 1 invalid/);
+    expect((await new WatermarkStore(store.scopeDir("project")).read()).lastEntryId).toBe("e2");
+    expect(await store.all()).toEqual([]);
+  });
+
+  it("applies valid ops while dropping an invalid sibling", async () => {
+    const raw = JSON.stringify([
+      { op: "UNKNOWN" },
+      { op: "ADD", type: "fact", title: "Kept fact", body: "Valid sibling survives.", scope: "project", confidence: 0.9 },
+    ]);
+    const res = await runConsolidation(store, entries, { complete: async () => raw, cfg: DEFAULT_CONFIG, sessionId: "s1", now: NOW });
+    expect(res.ok).toBe(true);
+    expect(res.applied?.added).toHaveLength(1);
+    expect((await store.all()).map((f) => f.title)).toEqual(["Kept fact"]);
   });
 
   it("cancels a queued commit without waiting for another mutation to finish", async () => {

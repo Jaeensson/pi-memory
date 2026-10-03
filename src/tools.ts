@@ -21,9 +21,16 @@ const SECRET_PATTERNS: { re: RegExp; label: string }[] = [
   { re: /\b[0-9a-f]{32,}\b/i, label: "hex blob" },
 ];
 
+// Git commit and content hashes are legitimate evidence ("fixed in <sha>",
+// anchors), and are the only common 40/64-char hex runs in developer prose.
+// Mask them before the blob heuristics so citing a commit is not mistaken for a
+// secret. Other lengths are untouched: a 32-char hex token still trips.
+const SHA_LIKE = /\b[0-9a-f]{40}\b|\b[0-9a-f]{64}\b/gi;
+
 export function secretScan(text: string): { ok: boolean; reason?: string } {
+  const scrubbed = text.replace(SHA_LIKE, "«sha»");
   for (const { re, label } of SECRET_PATTERNS) {
-    if (re.test(text)) return { ok: false, reason: `rejected: looks like a secret: ${label}` };
+    if (re.test(scrubbed)) return { ok: false, reason: `rejected: looks like a secret: ${label}` };
   }
   return { ok: true };
 }
@@ -280,7 +287,12 @@ export async function handleMemorySearch(
 ): Promise<ToolResult> {
   const scopes: MemoryScope[] =
     params.scope === "project" ? ["project"] : params.scope === "global" ? ["global"] : ["project", "global"];
-  const limit = params.limit ?? 10;
+  // A negative/non-integer limit used to fall through to slice(0, -1) = all but one.
+  const requestedLimit = params.limit;
+  const limit =
+    typeof requestedLimit === "number" && Number.isInteger(requestedLimit) && requestedLimit > 0
+      ? requestedLimit
+      : 10;
   const files: MemoryFile[] = [];
   for (const scope of scopes) {
     for (const file of await store.list(scope)) {
@@ -408,8 +420,16 @@ export async function handleMemoryList(
     return true;
   });
   filtered.sort((a, b) => b.strength - a.strength || a.id.localeCompare(b.id));
-  const offset = Math.max(0, params.offset ?? 0);
-  const limit = Math.max(1, params.limit ?? 50);
+  const requestedOffset = params.offset;
+  const offset =
+    typeof requestedOffset === "number" && Number.isInteger(requestedOffset) && requestedOffset > 0
+      ? requestedOffset
+      : 0;
+  const requestedLimit = params.limit;
+  const limit =
+    typeof requestedLimit === "number" && Number.isInteger(requestedLimit) && requestedLimit > 0
+      ? requestedLimit
+      : 50;
   const page = filtered.slice(offset, offset + limit);
   const lines = page.map((f) => {
     let line = `- [${f.id}] ${f.type} | ${f.title} | s=${f.strength} | ${effectiveStatus(f)}`;

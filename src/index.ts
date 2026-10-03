@@ -169,6 +169,8 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", async (event, ctx) => {
     shuttingDown = false;
+    writesDisabled = false; // a storage error is scoped to one session
+    store = undefined; // never carry a prior session's store into this one
     cfg = await loadConfig(memoryRoot);
     if (!cfg.enabled) return;
     const slug = await resolveProjectSlug(ctx.cwd);

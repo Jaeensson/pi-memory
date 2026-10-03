@@ -111,6 +111,21 @@ describe("MarkdownStore", () => {
     expect(got?.lastUsed).toBe("2026-09-08T12:00:00.000Z");
   });
 
+  it("rebuilds the index once per scope for a batched mutation", async () => {
+    const ids: string[] = [];
+    for (let i = 0; i < 5; i++) ids.push((await store.save(mem({ title: `batched ${i}` }))).id);
+    let regens = 0;
+    const target = store as unknown as Record<string, unknown>;
+    const original = (target.regenerateIndexUnlocked as (scope: string) => Promise<void>).bind(store);
+    target.regenerateIndexUnlocked = (scope: string) => {
+      regens += 1;
+      return original(scope);
+    };
+    await store.bumpUsage(ids);
+    // Five writes in one mutation → one index rebuild, not five.
+    expect(regens).toBe(1);
+  });
+
   it("moveToArchive removes from index and writes reason sidecar", async () => {
     const f = await store.save(mem());
     expect(await store.moveToArchive(f.id, "obsolete")).toBe(true);

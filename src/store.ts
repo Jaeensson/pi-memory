@@ -291,6 +291,16 @@ function writeAtomic(path: string, data: string): Promise<void> {
 
 const mutationContext = new AsyncLocalStorage<Set<string>>();
 
+/**
+ * Scopes whose index must be regenerated when the enclosing mutation commits.
+ * Batching collapses N file writes into one index rebuild per scope instead of
+ * one rebuild per write (which made a batch of reads O(n²) disk work).
+ */
+interface IndexBatch {
+  dirty: Set<MemoryScope>;
+}
+const indexBatchContext = new AsyncLocalStorage<IndexBatch>();
+
 export class MarkdownStore {
   readonly root: string;
   readonly projectSlug: string;
@@ -337,7 +347,21 @@ export class MarkdownStore {
       started = true;
       const nested = new Set(active ?? []);
       nested.add(canonicalRoot);
-      return mutationContext.run(nested, fn);
+      const batch: IndexBatch = { dirty: new Set() };
+      let failed = false;
+      try {
+        return await mutationContext.run(nested, () => indexBatchContext.run(batch, fn));
+      } catch (error) {
+        failed = true;
+        throw error;
+      } finally {
+        try {
+          await this.flushIndexes(batch);
+        } catch (flushError) {
+          // Never mask the body error; a stale index is recoverable on the next write.
+          if (!failed) throw flushError;
+        }
+      }
     });
     if (!signal) return operation;
     return new Promise<T>((resolveOperation, rejectOperation) => {
@@ -553,8 +577,24 @@ export class MarkdownStore {
   }
 
   async regenerateIndex(scope: MemoryScope): Promise<void> {
+    // Inside a mutation, defer to the batch: one rebuild per scope on commit.
+    const batch = indexBatchContext.getStore();
+    if (batch) {
+      batch.dirty.add(scope);
+      return;
+    }
+    return this.queueIndexRegeneration(scope);
+  }
+
+  private async flushIndexes(batch: IndexBatch): Promise<void> {
+    const scopes = [...batch.dirty];
+    batch.dirty.clear();
+    for (const scope of scopes) await this.queueIndexRegeneration(scope);
+  }
+
+  private queueIndexRegeneration(scope: MemoryScope): Promise<void> {
     // Exclusive: concurrent tool calls (pi's default) each end in a queued
-    // regenerateIndex, so the final one always reflects every completed write.
+    // regeneration, so the final one always reflects every completed write.
     const run = this.indexQueue.then(() => this.regenerateIndexUnlocked(scope));
     this.indexQueue = run.then(() => undefined, () => undefined);
     return run;
@@ -563,12 +603,15 @@ export class MarkdownStore {
   private async regenerateIndexUnlocked(scope: MemoryScope): Promise<void> {
     const files = await this.activeFiles(scope);
     const lines: string[] = [];
+    // Byte caps are measured in UTF-8 bytes, not UTF-16 code units, so emoji and
+    // other multi-byte titles cannot overrun indexMaxBytes.
+    const size = (s: string) => Buffer.byteLength(s, "utf8");
     let bytes = 0;
     for (const f of files) {
       const line = indexLine(f);
-      if (lines.length >= this.limits.indexMaxLines || bytes + line.length + 1 > this.limits.indexMaxBytes) break;
+      if (lines.length >= this.limits.indexMaxLines || bytes + size(line) + 1 > this.limits.indexMaxBytes) break;
       lines.push(line);
-      bytes += line.length + 1;
+      bytes += size(line) + 1;
     }
     if (lines.length < files.length) {
       // The trailer occupies the last slot inside both caps; drop entry lines until it fits.
@@ -576,10 +619,10 @@ export class MarkdownStore {
       while (
         lines.length > 0 &&
         (lines.length + 1 > this.limits.indexMaxLines ||
-          bytes + `…${files.length - lines.length} more — use memory_search`.length + 1 >
+          bytes + size(`…${files.length - lines.length} more — use memory_search`) + 1 >
             this.limits.indexMaxBytes)
       ) {
-        bytes -= lines.pop()!.length + 1;
+        bytes -= size(lines.pop()!) + 1;
       }
       lines.push(`…${files.length - lines.length} more — use memory_search`);
     }

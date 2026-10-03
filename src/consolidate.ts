@@ -1,4 +1,5 @@
 import { readFile, rename, writeFile } from "node:fs/promises";
+import { randomBytes } from "node:crypto";
 import { join } from "node:path";
 import type { MemoryConfig } from "./config.js";
 import { applyDecayAndPrune } from "./usage.js";
@@ -250,7 +251,8 @@ export class WatermarkStore {
     }
   }
   async write(s: StateFile): Promise<void> {
-    const tmp = `${this.path}.${process.pid}.tmp`;
+    // Randomized suffix: two writers in one process must never share a tmp path.
+    const tmp = `${this.path}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
     await writeFile(tmp, JSON.stringify(s, null, 2), "utf8");
     await rename(tmp, this.path);
   }
@@ -294,15 +296,20 @@ export async function runConsolidation(
       return { ok: false, reason: err instanceof Error ? err.message : String(err) };
     }
     const extracted = parseExtraction(raw);
-    if (extracted === null || !extracted.every(isValidOp)) {
-      return { ok: false, reason: "invalid memory extraction: expected an array of valid operations" };
+    if (extracted === null) {
+      return { ok: false, reason: "invalid memory extraction: expected a JSON array" };
     }
-    const ops = extracted.slice(0, opts.cfg.maxOpsPerRun);
+    // Lenient per design §7.2: drop malformed entries and keep the rest. Rejecting
+    // the whole batch on one bad op left the watermark unadvanced, so the same
+    // transcript was re-sent on every idle tick.
+    const invalid = extracted.filter((op) => !isValidOp(op)).length;
+    const ops = extracted.filter(isValidOp).slice(0, opts.cfg.maxOpsPerRun);
     return store.withMutation(async () => {
       opts.signal?.throwIfAborted();
       // Once file mutation starts, finish the commit including its watermark.
       // Shutdown awaits this phase rather than leaving partially applied state.
       const applied = await applyOps(store, ops, { maxOpsPerRun: opts.cfg.maxOpsPerRun }, opts.now);
+      if (invalid > 0) applied.notes.push(`dropped ${invalid} invalid operation(s)`);
       const { pruned } = await applyDecayAndPrune(store, opts.cfg, opts.now);
       if (lastId !== null) {
         await wm.write({

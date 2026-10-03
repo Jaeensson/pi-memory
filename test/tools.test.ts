@@ -37,6 +37,15 @@ describe("secretScan", () => {
   it("allows normal prose", () => {
     expect(secretScan("We chose pnpm because workspaces are faster.").ok).toBe(true);
   });
+
+  it("allows a full git hash cited as evidence", () => {
+    expect(secretScan("Fixed in commit 6ef69f3a1b2c3d4e5f60718293a4b5c6d7e8f901.").ok).toBe(true);
+    expect(secretScan(`content hash ${"a".repeat(64)}`).ok).toBe(true);
+  });
+
+  it("still rejects a non-hash hex blob", () => {
+    expect(secretScan("token deadbeefdeadbeefdeadbeefdeadbeef").ok).toBe(false);
+  });
 });
 
 describe("dedupCheck", () => {

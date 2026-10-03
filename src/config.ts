@@ -33,6 +33,34 @@ export const DEFAULT_CONFIG: MemoryConfig = {
 
 const CONFIG_KEYS = new Set(Object.keys(DEFAULT_CONFIG));
 
+type ConfigValidator = (value: unknown) => boolean;
+const isBoolean: ConfigValidator = (v) => typeof v === "boolean";
+const isPositiveNumber: ConfigValidator = (v) => typeof v === "number" && Number.isFinite(v) && v > 0;
+const isNonNegativeNumber: ConfigValidator = (v) => typeof v === "number" && Number.isFinite(v) && v >= 0;
+const isNonNegativeInteger: ConfigValidator = (v) => typeof v === "number" && Number.isInteger(v) && v >= 0;
+const isPositiveInteger: ConfigValidator = (v) => typeof v === "number" && Number.isInteger(v) && v > 0;
+const isUnitInterval: ConfigValidator = (v) =>
+  typeof v === "number" && Number.isFinite(v) && v >= 0 && v <= 1;
+const isNullableString: ConfigValidator = (v) => v === null || typeof v === "string";
+
+// Unvalidated values used to flow straight into timers and budgets, where a
+// string like "soon" became NaN and fired setTimeout immediately. Every key is
+// type/range-checked; an invalid value falls back to its default.
+const CONFIG_VALIDATORS: Record<keyof MemoryConfig, ConfigValidator> = {
+  enabled: isBoolean,
+  idleSeconds: isPositiveNumber,
+  indexMaxLines: isPositiveInteger,
+  indexMaxBytes: isPositiveInteger,
+  pinnedMaxTokens: isNonNegativeInteger,
+  indexMaxTokens: isNonNegativeInteger,
+  pruneDays: isNonNegativeNumber,
+  pruneStrength: isUnitInterval,
+  halfLifeDays: isPositiveNumber,
+  maxOpsPerRun: isNonNegativeInteger,
+  consolidationModel: isNullableString,
+  globalEnabled: isBoolean,
+};
+
 export async function loadConfig(root: string): Promise<MemoryConfig> {
   const path = join(root, "config.json");
   let raw: string | undefined;
@@ -50,8 +78,10 @@ export async function loadConfig(root: string): Promise<MemoryConfig> {
     const parsed = JSON.parse(raw) as Record<string, unknown>;
     const merged: MemoryConfig = { ...DEFAULT_CONFIG };
     for (const key of CONFIG_KEYS) {
-      if (parsed[key] !== undefined) {
-        (merged as unknown as Record<string, unknown>)[key] = parsed[key];
+      const value = parsed[key];
+      if (value === undefined) continue;
+      if (CONFIG_VALIDATORS[key as keyof MemoryConfig](value)) {
+        (merged as unknown as Record<string, unknown>)[key] = value;
       }
     }
     return merged;

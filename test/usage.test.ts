@@ -59,6 +59,22 @@ describe("applyDecayAndPrune", () => {
     expect(await store.get(pinned.id)).toBeDefined();
   });
 
+  it("does not rewrite a file whose rounded strength is unchanged", async () => {
+    const f = await store.save({ type: "fact", title: "stable", body: "b" });
+    const cfg = { halfLifeDays: 14, pruneDays: 30, pruneStrength: 0.3 };
+    await applyDecayAndPrune(store, cfg, NOW);
+    const afterFirst = (await store.get(f.id))!.strength;
+    let updates = 0;
+    const original = store.update.bind(store);
+    store.update = async (file) => {
+      updates += 1;
+      return original(file);
+    };
+    await applyDecayAndPrune(store, cfg, NOW);
+    expect(updates).toBe(0); // no-op decay must not churn the file or its index
+    expect((await store.get(f.id))!.strength).toBe(afterFirst);
+  });
+
   it("keeps a memory at exactly the prune-day boundary (strict >)", async () => {
     // Regression pin: ageDays > pruneDays is strict, so exactly 30d survives with
     // its recomputed strength. The strength ≥ pruneStrength gate is currently
