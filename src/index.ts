@@ -78,6 +78,9 @@ export default function (pi: ExtensionAPI) {
   const makeComplete = (ctx: ExtensionContext, signal: AbortSignal): CompleteFn => {
     // Capture session-bound model state before any asynchronous work.
     const registry = ctx.modelRegistry;
+    // opencode/opencode-go route via x-opencode-session; without sessionId the
+    // server rejects with 400 MissingSessionID even when caching is disabled.
+    const sessionId = ctx.sessionManager.getSessionId();
     let model = ctx.model;
     if (cfg?.consolidationModel) {
       const [providerId, ...rest] = cfg.consolidationModel.split("/");
@@ -99,7 +102,7 @@ export default function (pi: ExtensionAPI) {
             },
           ],
         },
-        { cacheRetention: "none", signal },
+        { cacheRetention: "none", signal, sessionId },
       ).result(), signal);
       if (response.stopReason !== "stop") {
         throw new Error(response.errorMessage ?? `memory consolidation did not finish (${response.stopReason})`);

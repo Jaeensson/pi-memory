@@ -65,6 +65,23 @@ describe("prompt and consolidation integration", () => {
     expect(app.notifications.some((n) => n.level === "warning" && /consolidation failed/.test(n.message))).toBe(true);
   });
 
+  it("forwards the session id so opencode-go routing accepts consolidation", async () => {
+    const app = await harness();
+    await app.emit("session_start");
+    app.sessionManager.appendMessage({ role: "user", content: "Use an embedded cache.", timestamp: Date.now() });
+    let seenOptions: { sessionId?: unknown; cacheRetention?: unknown } | undefined;
+    const inner = app.ctx.modelRegistry.streamSimple;
+    (app.ctx.modelRegistry as any).streamSimple = (model: unknown, context: unknown, options?: any) => {
+      seenOptions = options;
+      return (inner as any)(model, context, options);
+    };
+    app.setCompletion(async () => response("[]"));
+    vi.useFakeTimers();
+    await app.emit("session_shutdown");
+    expect(seenOptions?.sessionId).toBe(app.sessionManager.getSessionId());
+    expect(seenOptions?.cacheRetention).toBe("none");
+  });
+
   it("extracts memories through the provider-neutral model path", async () => {
     const app = await harness();
     await app.emit("session_start");
